@@ -144,6 +144,8 @@ usage() {
 用法：
   scripts/ai-toolchain-manager.sh [snapshot|check|fix|update|all|selftest|check-raw|update-one]
   scripts/ai-toolchain-manager.sh update-one [claude|codex|gemini|kimi]
+  scripts/ai-toolchain-manager.sh all --compact
+  scripts/ai-toolchain-manager.sh update-one codex --compact
 
 说明：
   snapshot 输出当前四项工具的摘要和建议，适合启动前预览
@@ -154,6 +156,7 @@ usage() {
   update-one 仅更新单个工具
   all     一键执行：check -> fix -> update -> check
   selftest  仅执行逻辑回归测试，不安装不更新
+  --compact 仅输出简略进度（建议用于 all / update-one）
 
 可选环境变量：
   NPM_REGISTRY=https://registry.npmjs.org
@@ -776,9 +779,156 @@ update_one_tool() {
   esac
 }
 
+tool_display_name() {
+  case "$1" in
+    claude) printf 'Claude' ;;
+    codex) printf 'Codex' ;;
+    gemini) printf 'Gemini' ;;
+    kimi) printf 'Kimi' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+raw_metrics() {
+  local raw="$1"
+  awk -F'|' '
+    NF >= 5 {
+      total++
+      status = $5
+      if (status == "可更新") {
+        updatable++
+      } else if (status == "已是最新" || status == "本地更新" || status == "已安装" || status == "无需处理") {
+        healthy++
+      } else {
+        issue++
+      }
+    }
+    END {
+      printf "%d|%d|%d|%d\n", total + 0, updatable + 0, healthy + 0, issue + 0
+    }
+  ' <<<"$raw"
+}
+
+raw_tool_record() {
+  local raw="$1"
+  local key="$2"
+  awk -F'|' -v k="$key" '$1 == k { print; exit }' <<<"$raw"
+}
+
+run_detailed_with_fallback() {
+  local stage_title="$1"
+  shift
+  local tmp_file exit_code
+  tmp_file="$(mktemp)"
+  if "$0" "$@" >"$tmp_file" 2>&1; then
+    rm -f "$tmp_file"
+    return 0
+  else
+    exit_code=$?
+  fi
+
+  log "$(color "$ANSI_RED$ANSI_BOLD" "${stage_title}失败（exit=${exit_code}）" "$ANSI_RESET")"
+  log "以下为该阶段详细输出："
+  cat "$tmp_file"
+  rm -f "$tmp_file"
+  return "$exit_code"
+}
+
+run_all_compact() {
+  local raw_before raw_after_fix raw_after_update raw_final
+  local metrics before_updatable before_issue after_fix_issue before_update_updatable after_update_updatable updated_count fixed_count
+
+  log "$(color "$ANSI_BOLD$ANSI_CYAN" "一键全量处理：check -> fix -> update -> check（简略进度）" "$ANSI_RESET")"
+  log ""
+
+  log "[1/4] 检查中..."
+  raw_before="$(check_raw)"
+  metrics="$(raw_metrics "$raw_before")"
+  IFS='|' read -r _ before_updatable _ before_issue <<<"$metrics"
+  log "[1/4] 检查完成：可更新 ${before_updatable} 项，异常 ${before_issue} 项。"
+  log ""
+
+  log "[2/4] 修复中..."
+  run_detailed_with_fallback "[2/4] 修复阶段" fix
+  raw_after_fix="$(check_raw)"
+  metrics="$(raw_metrics "$raw_after_fix")"
+  IFS='|' read -r _ _ _ after_fix_issue <<<"$metrics"
+  fixed_count=$((before_issue - after_fix_issue))
+  if [ "$fixed_count" -lt 0 ]; then
+    fixed_count=0
+  fi
+  log "[2/4] 修复完成：修复 ${fixed_count} 项，剩余异常 ${after_fix_issue} 项。"
+  log ""
+
+  log "[3/4] 更新中..."
+  metrics="$(raw_metrics "$raw_after_fix")"
+  IFS='|' read -r _ before_update_updatable _ _ <<<"$metrics"
+  run_detailed_with_fallback "[3/4] 更新阶段" update
+  raw_after_update="$(check_raw)"
+  metrics="$(raw_metrics "$raw_after_update")"
+  IFS='|' read -r _ after_update_updatable _ _ <<<"$metrics"
+  updated_count=$((before_update_updatable - after_update_updatable))
+  if [ "$updated_count" -lt 0 ]; then
+    updated_count=0
+  fi
+  log "[3/4] 更新完成：已更新 ${updated_count} 项，仍可更新 ${after_update_updatable} 项。"
+  log ""
+
+  log "[4/4] 复检中..."
+  raw_final="$(check_raw)"
+  metrics="$(raw_metrics "$raw_final")"
+  IFS='|' read -r _ before_updatable _ before_issue <<<"$metrics"
+  log "[4/4] 复检完成：可更新 ${before_updatable} 项，异常 ${before_issue} 项。"
+  if [ "$before_updatable" -eq 0 ] && [ "$before_issue" -eq 0 ]; then
+    log "$(color "$ANSI_GREEN$ANSI_BOLD" "结果：全部已是最新，且无异常。" "$ANSI_RESET")"
+  else
+    log "$(color "$ANSI_YELLOW$ANSI_BOLD" "结果：仍有待处理项（可更新 ${before_updatable}，异常 ${before_issue}）。" "$ANSI_RESET")"
+  fi
+}
+
+run_update_one_compact() {
+  local tool_key="$1"
+  local tool_name record status current latest
+  local raw
+
+  tool_name="$(tool_display_name "$tool_key")"
+  log "$(color "$ANSI_BOLD$ANSI_CYAN" "单项更新（简略进度）" "$ANSI_RESET")"
+  log "更新 ${tool_name} 中..."
+  run_detailed_with_fallback "更新 ${tool_name}" update-one "$tool_key"
+  log "更新 ${tool_name} 完成。"
+
+  raw="$(check_raw)"
+  record="$(raw_tool_record "$raw" "$tool_key")"
+  if [ -z "$record" ]; then
+    log "$(color "$ANSI_YELLOW$ANSI_BOLD" "复检：未获取到 ${tool_name} 状态，请执行 check 查看详情。" "$ANSI_RESET")"
+    return 0
+  fi
+
+  IFS='|' read -r _ _ current latest status _ _ <<<"$record"
+  log "复检：${tool_name} ${status}（当前 ${current}，最新 ${latest}）。"
+}
+
 main() {
   local mode="${1:-check}"
-  local target_tool="${2:-}"
+  local target_tool=""
+  local compact=0
+  local arg
+  local -a extra_args=()
+
+  if [ "${TOOLCHAIN_COMPACT:-0}" = "1" ]; then
+    compact=1
+  fi
+
+  for arg in "${@:2}"; do
+    case "$arg" in
+      --compact)
+        compact=1
+        ;;
+      *)
+        extra_args+=("$arg")
+        ;;
+    esac
+  done
 
   case "$mode" in
     snapshot|check|fix|update|all|selftest|check-raw|update-one) ;;
@@ -791,6 +941,20 @@ main() {
       exit 1
       ;;
   esac
+
+  if [ "$mode" = "update-one" ]; then
+    if [ "${#extra_args[@]}" -lt 1 ]; then
+      die "用法：scripts/ai-toolchain-manager.sh update-one [claude|codex|gemini|kimi]"
+    fi
+    if [ "${#extra_args[@]}" -gt 1 ]; then
+      die "update-one 参数过多：${extra_args[*]}"
+    fi
+    target_tool="$(printf '%s' "${extra_args[0]}" | tr '[:upper:]' '[:lower:]')"
+  else
+    if [ "${#extra_args[@]}" -gt 0 ]; then
+      die "未知参数：${extra_args[*]}"
+    fi
+  fi
 
   require_cmd npm
   require_cmd curl
@@ -811,6 +975,11 @@ main() {
   fi
 
   if [ "$mode" = "all" ]; then
+    if [ "$compact" -eq 1 ]; then
+      run_all_compact
+      return 0
+    fi
+
     log "$(color "$ANSI_BOLD$ANSI_CYAN" "一键全量处理：check -> fix -> update -> check" "$ANSI_RESET")"
     log ""
     log "$(color "$ANSI_BOLD" "[1/4] 执行检查" "$ANSI_RESET")"
@@ -830,8 +999,11 @@ main() {
   fi
 
   if [ "$mode" = "update-one" ]; then
-    target_tool="$(printf '%s' "$target_tool" | tr '[:upper:]' '[:lower:]')"
-    [ -n "$target_tool" ] || die "用法：scripts/ai-toolchain-manager.sh update-one [claude|codex|gemini|kimi]"
+    if [ "$compact" -eq 1 ]; then
+      run_update_one_compact "$target_tool"
+      return 0
+    fi
+
     log "$(color "$ANSI_BOLD$ANSI_CYAN" "执行模式：update-one (${target_tool})" "$ANSI_RESET")"
     log ""
     log "执行前检查："

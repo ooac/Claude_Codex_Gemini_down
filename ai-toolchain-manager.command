@@ -84,26 +84,26 @@ run_interactive_menu() {
     fi
     case "$input" in
       "")
-        run_mode all
+        run_mode all --compact
         break
         ;;
       "1")
-        run_mode update-one claude || true
+        run_mode update-one claude --compact || true
         printf '\n'
         render_snapshot
         ;;
       "2")
-        run_mode update-one codex || true
+        run_mode update-one codex --compact || true
         printf '\n'
         render_snapshot
         ;;
       "3")
-        run_mode update-one gemini || true
+        run_mode update-one gemini --compact || true
         printf '\n'
         render_snapshot
         ;;
       "4")
-        run_mode update-one kimi || true
+        run_mode update-one kimi --compact || true
         printf '\n'
         render_snapshot
         ;;
