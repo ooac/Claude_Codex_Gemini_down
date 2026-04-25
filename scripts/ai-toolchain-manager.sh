@@ -142,13 +142,16 @@ card_row() {
 usage() {
   cat <<'EOF'
 用法：
-  scripts/ai-toolchain-manager.sh [snapshot|check|fix|update|all|selftest]
+  scripts/ai-toolchain-manager.sh [snapshot|check|fix|update|all|selftest|check-raw|update-one]
+  scripts/ai-toolchain-manager.sh update-one [claude|codex|gemini|kimi]
 
 说明：
   snapshot 输出当前四项工具的摘要和建议，适合启动前预览
   check   只检查当前版本、最新版本和可执行状态
+  check-raw 机器可读检查输出，供 .command 解析菜单
   fix     修复损坏的入口或缺失的安装，不主动升级
   update  升级到最新版本，并修复入口
+  update-one 仅更新单个工具
   all     一键执行：check -> fix -> update -> check
   selftest  仅执行逻辑回归测试，不安装不更新
 
@@ -566,6 +569,53 @@ check_one_kimi() {
   log "$(color "$row_color" "$row" "$ANSI_RESET")"
 }
 
+raw_status_one() {
+  local key="$1"
+  local display_name="$2"
+  local cmd_name="$3"
+  local pkg="$4"
+  local probe state path version latest result status tip
+
+  probe="$(probe_tool "$cmd_name")"
+  state="${probe%%|*}"
+  path="${probe#*|}"
+  path="${path%%|*}"
+  version="${probe##*|}"
+  latest="$(latest_version "$pkg")"
+
+  result="$(status_and_tip "$state" "$version" "$latest")"
+  status="${result%%|*}"
+  tip="${result#*|}"
+
+  printf '%s|%s|%s|%s|%s|%s|%s\n' \
+    "$key" "$display_name" "${version:--}" "${latest:--}" "$status" "$tip" "${path:--}"
+}
+
+raw_status_kimi() {
+  local probe state path version latest result status tip
+
+  probe="$(probe_kimi)"
+  state="${probe%%|*}"
+  path="${probe#*|}"
+  path="${path%%|*}"
+  version="${probe##*|}"
+  latest="$(latest_kimi_version)"
+
+  result="$(status_and_tip_kimi "$state" "$version" "$latest")"
+  status="${result%%|*}"
+  tip="${result#*|}"
+
+  printf '%s|%s|%s|%s|%s|%s|%s\n' \
+    "kimi" "Kimi" "${version:--}" "${latest:--}" "$status" "$tip" "${path:--}"
+}
+
+check_raw() {
+  raw_status_one "claude" "Claude" "claude" "@anthropic-ai/claude-code"
+  raw_status_one "codex" "Codex" "codex" "@openai/codex"
+  raw_status_one "gemini" "Gemini" "gemini" "@google/gemini-cli"
+  raw_status_kimi
+}
+
 snapshot_one() {
   local display_name="$1"
   local cmd_name="$2"
@@ -679,10 +729,59 @@ repair_or_update_kimi() {
   fi
 }
 
+print_check_table() {
+  log "执行检查结果："
+  log "$(color "$ANSI_BOLD$ANSI_CYAN" "$(
+    printf '%s %s %s %s %s %s' \
+      "$(pad_display '工具' 8)" \
+      "$(pad_display '当前版本' 18)" \
+      "$(pad_display '最新版本' 18)" \
+      "$(pad_display '状态' 12)" \
+      "$(pad_display '建议' 18)" \
+      "命令路径"
+  )" "$ANSI_RESET")"
+  log "$(color "$ANSI_DIM$ANSI_GRAY" "$(
+    printf '%s %s %s %s %s %s' \
+      "$(pad_display '------' 8)" \
+      "$(pad_display '------' 18)" \
+      "$(pad_display '------' 18)" \
+      "$(pad_display '------' 12)" \
+      "$(pad_display '------' 18)" \
+      "------"
+  )" "$ANSI_RESET")"
+  check_one "Claude" "claude" "@anthropic-ai/claude-code" "$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code"
+  check_one "Codex" "codex" "@openai/codex" "$NPM_GLOBAL_PREFIX/lib/node_modules/@openai/codex"
+  check_one "Gemini" "gemini" "@google/gemini-cli" "$NPM_GLOBAL_PREFIX/lib/node_modules/@google/gemini-cli"
+  check_one_kimi
+}
+
+update_one_tool() {
+  local tool_key="$1"
+  case "$tool_key" in
+    claude)
+      repair_or_update_one "Claude" "claude" "@anthropic-ai/claude-code" "$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code" "update"
+      ;;
+    codex)
+      repair_or_update_one "Codex" "codex" "@openai/codex" "$NPM_GLOBAL_PREFIX/lib/node_modules/@openai/codex" "update"
+      ;;
+    gemini)
+      repair_or_update_one "Gemini" "gemini" "@google/gemini-cli" "$NPM_GLOBAL_PREFIX/lib/node_modules/@google/gemini-cli" "update"
+      ;;
+    kimi)
+      repair_or_update_kimi "update"
+      ;;
+    *)
+      die "update-one 仅支持：claude|codex|gemini|kimi"
+      ;;
+  esac
+}
+
 main() {
   local mode="${1:-check}"
+  local target_tool="${2:-}"
+
   case "$mode" in
-    snapshot|check|fix|update|all|selftest) ;;
+    snapshot|check|fix|update|all|selftest|check-raw|update-one) ;;
     -h|--help|help)
       usage
       exit 0
@@ -700,6 +799,11 @@ main() {
   require_cmd python3
 
   mkdir -p "$NPM_CACHE" "$NPM_GLOBAL_PREFIX" "$CLAUDE_PREFIX"
+
+  if [ "$mode" = "check-raw" ]; then
+    check_raw
+    return 0
+  fi
 
   if [ "$mode" = "selftest" ]; then
     selftest
@@ -725,6 +829,23 @@ main() {
     return 0
   fi
 
+  if [ "$mode" = "update-one" ]; then
+    target_tool="$(printf '%s' "$target_tool" | tr '[:upper:]' '[:lower:]')"
+    [ -n "$target_tool" ] || die "用法：scripts/ai-toolchain-manager.sh update-one [claude|codex|gemini|kimi]"
+    log "$(color "$ANSI_BOLD$ANSI_CYAN" "执行模式：update-one (${target_tool})" "$ANSI_RESET")"
+    log ""
+    log "执行前检查："
+    print_check_table
+    log ""
+    log "开始执行单项更新..."
+    update_one_tool "$target_tool"
+    ensure_links
+    log ""
+    log "复检结果："
+    print_check_table
+    return 0
+  fi
+
   if [ "$mode" = "snapshot" ]; then
     log "$(color "$ANSI_BOLD$ANSI_CYAN" "AI 工具链摘要" "$ANSI_RESET")"
     log "$(color "$ANSI_DIM$ANSI_GRAY" "────────────────────────────────" "$ANSI_RESET")"
@@ -737,29 +858,7 @@ main() {
 
   log "$(color "$ANSI_BOLD$ANSI_CYAN" "执行模式：${mode}" "$ANSI_RESET")"
   log ""
-  log "执行检查结果："
-  log "$(color "$ANSI_BOLD$ANSI_CYAN" "$(
-    printf '%s %s %s %s %s %s' \
-      "$(pad_display '工具' 8)" \
-      "$(pad_display '当前版本' 18)" \
-      "$(pad_display '最新版本' 18)" \
-      "$(pad_display '状态' 12)" \
-      "$(pad_display '建议' 18)" \
-      "命令路径"
-  )" "$ANSI_RESET")"
-  log "$(color "$ANSI_DIM$ANSI_GRAY" "$(
-    printf '%s %s %s %s %s %s' \
-      "$(pad_display '------' 8)" \
-      "$(pad_display '------' 18)" \
-      "$(pad_display '------' 18)" \
-      "$(pad_display '------' 12)" \
-      "$(pad_display '------' 18)" \
-      "------"
-  )" "$ANSI_RESET")"
-  check_one "Claude" "claude" "@anthropic-ai/claude-code" "$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code"
-  check_one "Codex" "codex" "@openai/codex" "$NPM_GLOBAL_PREFIX/lib/node_modules/@openai/codex"
-  check_one "Gemini" "gemini" "@google/gemini-cli" "$NPM_GLOBAL_PREFIX/lib/node_modules/@google/gemini-cli"
-  check_one_kimi
+  print_check_table
 
   if [ "$mode" = "check" ]; then
     return 0
@@ -776,28 +875,7 @@ main() {
 
   log ""
   log "复检结果："
-  log "$(color "$ANSI_BOLD$ANSI_CYAN" "$(
-    printf '%s %s %s %s %s %s' \
-      "$(pad_display '工具' 8)" \
-      "$(pad_display '当前版本' 18)" \
-      "$(pad_display '最新版本' 18)" \
-      "$(pad_display '状态' 12)" \
-      "$(pad_display '建议' 18)" \
-      "命令路径"
-  )" "$ANSI_RESET")"
-  log "$(color "$ANSI_DIM$ANSI_GRAY" "$(
-    printf '%s %s %s %s %s %s' \
-      "$(pad_display '------' 8)" \
-      "$(pad_display '------' 18)" \
-      "$(pad_display '------' 18)" \
-      "$(pad_display '------' 12)" \
-      "$(pad_display '------' 18)" \
-      "------"
-  )" "$ANSI_RESET")"
-  check_one "Claude" "claude" "@anthropic-ai/claude-code" "$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code"
-  check_one "Codex" "codex" "@openai/codex" "$NPM_GLOBAL_PREFIX/lib/node_modules/@openai/codex"
-  check_one "Gemini" "gemini" "@google/gemini-cli" "$NPM_GLOBAL_PREFIX/lib/node_modules/@google/gemini-cli"
-  check_one_kimi
+  print_check_table
 }
 
 main "$@"

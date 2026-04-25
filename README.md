@@ -9,14 +9,13 @@
 
 ## 使用方式
 
-双击 `ai-toolchain-manager.command`，然后用按钮选择模式：
+双击 `ai-toolchain-manager.command` 后会先显示摘要，然后进入终端菜单：
 
-- `check`：只检查当前版本和最新版本
-- `fix`：修复异常的安装或入口
-- `update`：更新到最新版并自动修复入口
-- `snapshot`：只看四项工具的摘要
-- `all`：一键全量处理（`check -> fix -> update -> check`）
-- `selftest`：逻辑回归测试（不安装不更新）
+- 直接回车：一键全量处理（`check -> fix -> update -> check`）
+- 输入 `1/2/3/4`：单项升级（Claude/Codex/Gemini/Kimi）
+- 输入 `c`：只检查
+- 输入 `f`：修复异常
+- 输入 `q`：退出
 
 `update` 是批量更新，一次会处理 Claude、Codex、Gemini、Kimi 四项。
 `all` 是一键搞定模式，直接把常见问题全流程跑完。
@@ -46,6 +45,8 @@ chmod +x ai-toolchain-manager.command scripts/ai-toolchain-manager.sh
 ./scripts/ai-toolchain-manager.sh update
 ./scripts/ai-toolchain-manager.sh all
 ./scripts/ai-toolchain-manager.sh selftest
+./scripts/ai-toolchain-manager.sh check-raw
+./scripts/ai-toolchain-manager.sh update-one codex
 ```
 
 如果只想双击运行：
