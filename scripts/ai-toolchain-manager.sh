@@ -217,6 +217,12 @@ installed_pkg_version() {
 ensure_link() {
   local link_path="$1"
   local target_path="$2"
+  if [ ! -e "$target_path" ]; then
+    if [ -L "$link_path" ]; then
+      rm -f "$link_path"
+    fi
+    return 0
+  fi
   mkdir -p "$(dirname "$link_path")"
   ln -sfn "$target_path" "$link_path"
 }
@@ -475,6 +481,13 @@ install_global_pkg() {
 }
 
 write_claude_wrapper() {
+  local wrapper_target="$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code/cli-wrapper.cjs"
+  if [ ! -f "$wrapper_target" ]; then
+    if [ -e "$CLAUDE_APP_LINK" ] || [ -L "$CLAUDE_APP_LINK" ]; then
+      rm -f "$CLAUDE_APP_LINK"
+    fi
+    return 0
+  fi
   mkdir -p "$(dirname "$CLAUDE_APP_LINK")"
   rm -f "$CLAUDE_APP_LINK"
   cat > "$CLAUDE_APP_LINK" <<EOF
