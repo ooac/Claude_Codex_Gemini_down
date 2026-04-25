@@ -19,7 +19,7 @@
 
 `update` 是批量更新，一次会处理 Claude、Codex、Gemini、Kimi 四项。
 `all` 是一键搞定模式，直接把常见问题全流程跑完。
-`all --compact` 与 `update-one --compact` 只显示阶段进度和简要结论；`check/fix/update` 默认保持详细输出，便于排障。
+`all --compact` 与 `update-one --compact` 只显示阶段进度和简要结论；已是最新项会自动跳过，不再重复执行更新。`check/fix/update` 默认保持详细输出，便于排障。
 `ai-toolchain-manager.command` 使用动态目录定位，不依赖固定用户路径。
 
 Kimi 的安装/更新来源：`curl -L code.kimi.com/install.sh | bash`

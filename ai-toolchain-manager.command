@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="$ROOT_DIR/scripts/ai-toolchain-manager.sh"
+RAW_STATUS=""
 cd "$ROOT_DIR"
 
 normalize_mode() {
@@ -36,10 +37,10 @@ render_snapshot() {
 }
 
 render_update_hint() {
-  local raw key name current latest status tip path item
+  local key name current latest status tip path item
   local update_items=""
 
-  raw="$("$SCRIPT_PATH" check-raw 2>/dev/null || true)"
+  RAW_STATUS="$("$SCRIPT_PATH" check-raw 2>/dev/null || true)"
   while IFS='|' read -r key name current latest status tip path; do
     [ -n "$key" ] || continue
     if [ "$status" = "可更新" ]; then
@@ -58,13 +59,39 @@ render_update_hint() {
         fi
       fi
     fi
-  done <<<"$raw"
+  done <<<"$RAW_STATUS"
 
   if [ -n "$update_items" ]; then
     printf '当前可更新项：%s\n' "$update_items"
   else
     printf '当前可更新项：无（均为最新或需先修复）\n'
   fi
+}
+
+status_from_current_raw() {
+  local key="$1"
+  awk -F'|' -v k="$key" '$1 == k { print $5; exit }' <<<"$RAW_STATUS"
+}
+
+should_run_single_update() {
+  local key="$1"
+  local name="$2"
+  local status
+
+  status="$(status_from_current_raw "$key")"
+  case "$status" in
+    可更新|未安装|不可执行|异常比较结果)
+      return 0
+      ;;
+    "")
+      printf '%s 当前状态未知，已跳过更新。\n' "$name"
+      return 1
+      ;;
+    *)
+      printf '%s 当前为“%s”，无需更新，已跳过。\n' "$name" "$status"
+      return 1
+      ;;
+  esac
 }
 
 run_interactive_menu() {
@@ -88,22 +115,30 @@ run_interactive_menu() {
         break
         ;;
       "1")
-        run_mode update-one claude --compact || true
+        if should_run_single_update "claude" "Claude"; then
+          run_mode update-one claude --compact || true
+        fi
         printf '\n'
         render_snapshot
         ;;
       "2")
-        run_mode update-one codex --compact || true
+        if should_run_single_update "codex" "Codex"; then
+          run_mode update-one codex --compact || true
+        fi
         printf '\n'
         render_snapshot
         ;;
       "3")
-        run_mode update-one gemini --compact || true
+        if should_run_single_update "gemini" "Gemini"; then
+          run_mode update-one gemini --compact || true
+        fi
         printf '\n'
         render_snapshot
         ;;
       "4")
-        run_mode update-one kimi --compact || true
+        if should_run_single_update "kimi" "Kimi"; then
+          run_mode update-one kimi --compact || true
+        fi
         printf '\n'
         render_snapshot
         ;;

@@ -815,6 +815,73 @@ raw_tool_record() {
   awk -F'|' -v k="$key" '$1 == k { print; exit }' <<<"$raw"
 }
 
+status_needs_update() {
+  case "${1:-}" in
+    可更新)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+status_needs_fix() {
+  case "${1:-}" in
+    未安装|不可执行|异常比较结果)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+count_tool_keys() {
+  local keys="${1:-}"
+  local key count=0
+  for key in $keys; do
+    count=$((count + 1))
+  done
+  printf '%s' "$count"
+}
+
+tool_names_from_keys() {
+  local keys="${1:-}"
+  local key out="" name
+  for key in $keys; do
+    name="$(tool_display_name "$key")"
+    out="${out}${out:+、}${name}"
+  done
+  printf '%s' "${out:-无}"
+}
+
+collect_tool_keys() {
+  local raw="$1"
+  local kind="$2"
+  local key status out=""
+
+  while IFS='|' read -r key _ _ _ status _ _; do
+    [ -n "$key" ] || continue
+    case "$kind" in
+      update)
+        if status_needs_update "$status"; then
+          out="${out}${out:+ }${key}"
+        fi
+        ;;
+      fix)
+        if status_needs_fix "$status"; then
+          out="${out}${out:+ }${key}"
+        fi
+        ;;
+      *)
+        ;;
+    esac
+  done <<<"$raw"
+
+  printf '%s' "$out"
+}
+
 run_detailed_with_fallback() {
   local stage_title="$1"
   shift
@@ -835,8 +902,10 @@ run_detailed_with_fallback() {
 }
 
 run_all_compact() {
-  local raw_before raw_after_fix raw_after_update raw_final
-  local metrics before_updatable before_issue after_fix_issue before_update_updatable after_update_updatable updated_count fixed_count
+  local raw_before raw_after_fix raw_final
+  local metrics before_updatable before_issue final_updatable final_issue
+  local fix_keys update_keys fix_count update_count fixed_count updated_count key name
+  local remaining_issue remaining_update
 
   log "$(color "$ANSI_BOLD$ANSI_CYAN" "一键全量处理：check -> fix -> update -> check（简略进度）" "$ANSI_RESET")"
   log ""
@@ -845,44 +914,68 @@ run_all_compact() {
   raw_before="$(check_raw)"
   metrics="$(raw_metrics "$raw_before")"
   IFS='|' read -r _ before_updatable _ before_issue <<<"$metrics"
+  fix_keys="$(collect_tool_keys "$raw_before" fix)"
+  update_keys="$(collect_tool_keys "$raw_before" update)"
+  fix_count="$(count_tool_keys "$fix_keys")"
+  update_count="$(count_tool_keys "$update_keys")"
   log "[1/4] 检查完成：可更新 ${before_updatable} 项，异常 ${before_issue} 项。"
   log ""
 
-  log "[2/4] 修复中..."
-  run_detailed_with_fallback "[2/4] 修复阶段" fix
-  raw_after_fix="$(check_raw)"
-  metrics="$(raw_metrics "$raw_after_fix")"
-  IFS='|' read -r _ _ _ after_fix_issue <<<"$metrics"
-  fixed_count=$((before_issue - after_fix_issue))
-  if [ "$fixed_count" -lt 0 ]; then
-    fixed_count=0
+  if [ "$fix_count" -eq 0 ] && [ "$update_count" -eq 0 ]; then
+    log "[2/4] 无需修复，已跳过。"
+    log "[3/4] 无需更新，已跳过。"
+    log "[4/4] 复检完成：可更新 0 项，异常 0 项。"
+    log "$(color "$ANSI_GREEN$ANSI_BOLD" "结果：全部已是最新，已跳过升级动作。" "$ANSI_RESET")"
+    return 0
   fi
-  log "[2/4] 修复完成：修复 ${fixed_count} 项，剩余异常 ${after_fix_issue} 项。"
+
+  if [ "$fix_count" -gt 0 ]; then
+    log "[2/4] 修复中：$(tool_names_from_keys "$fix_keys")..."
+    run_detailed_with_fallback "[2/4] 修复阶段" fix
+    raw_after_fix="$(check_raw)"
+    remaining_issue="$(count_tool_keys "$(collect_tool_keys "$raw_after_fix" fix)")"
+    fixed_count=$((fix_count - remaining_issue))
+    if [ "$fixed_count" -lt 0 ]; then
+      fixed_count=0
+    fi
+    log "[2/4] 修复完成：修复 ${fixed_count} 项，剩余异常 ${remaining_issue} 项。"
+  else
+    log "[2/4] 无需修复，已跳过。"
+    raw_after_fix="$raw_before"
+  fi
   log ""
 
-  log "[3/4] 更新中..."
-  metrics="$(raw_metrics "$raw_after_fix")"
-  IFS='|' read -r _ before_update_updatable _ _ <<<"$metrics"
-  run_detailed_with_fallback "[3/4] 更新阶段" update
-  raw_after_update="$(check_raw)"
-  metrics="$(raw_metrics "$raw_after_update")"
-  IFS='|' read -r _ after_update_updatable _ _ <<<"$metrics"
-  updated_count=$((before_update_updatable - after_update_updatable))
-  if [ "$updated_count" -lt 0 ]; then
+  update_keys="$(collect_tool_keys "$raw_after_fix" update)"
+  update_count="$(count_tool_keys "$update_keys")"
+  if [ "$update_count" -gt 0 ]; then
+    log "[3/4] 更新中：$(tool_names_from_keys "$update_keys")..."
     updated_count=0
+    for key in $update_keys; do
+      name="$(tool_display_name "$key")"
+      run_detailed_with_fallback "[3/4] 更新 ${name}" update-one "$key"
+      updated_count=$((updated_count + 1))
+    done
+    raw_final="$(check_raw)"
+    remaining_update="$(count_tool_keys "$(collect_tool_keys "$raw_final" update)")"
+    updated_count=$((updated_count - remaining_update))
+    if [ "$updated_count" -lt 0 ]; then
+      updated_count=0
+    fi
+    log "[3/4] 更新完成：已更新 ${updated_count} 项，仍可更新 ${remaining_update} 项。"
+  else
+    log "[3/4] 无需更新，已跳过。"
+    raw_final="$(check_raw)"
   fi
-  log "[3/4] 更新完成：已更新 ${updated_count} 项，仍可更新 ${after_update_updatable} 项。"
   log ""
 
   log "[4/4] 复检中..."
-  raw_final="$(check_raw)"
   metrics="$(raw_metrics "$raw_final")"
-  IFS='|' read -r _ before_updatable _ before_issue <<<"$metrics"
-  log "[4/4] 复检完成：可更新 ${before_updatable} 项，异常 ${before_issue} 项。"
-  if [ "$before_updatable" -eq 0 ] && [ "$before_issue" -eq 0 ]; then
+  IFS='|' read -r _ final_updatable _ final_issue <<<"$metrics"
+  log "[4/4] 复检完成：可更新 ${final_updatable} 项，异常 ${final_issue} 项。"
+  if [ "$final_updatable" -eq 0 ] && [ "$final_issue" -eq 0 ]; then
     log "$(color "$ANSI_GREEN$ANSI_BOLD" "结果：全部已是最新，且无异常。" "$ANSI_RESET")"
   else
-    log "$(color "$ANSI_YELLOW$ANSI_BOLD" "结果：仍有待处理项（可更新 ${before_updatable}，异常 ${before_issue}）。" "$ANSI_RESET")"
+    log "$(color "$ANSI_YELLOW$ANSI_BOLD" "结果：仍有待处理项（可更新 ${final_updatable}，异常 ${final_issue}）。" "$ANSI_RESET")"
   fi
 }
 
@@ -893,10 +986,6 @@ run_update_one_compact() {
 
   tool_name="$(tool_display_name "$tool_key")"
   log "$(color "$ANSI_BOLD$ANSI_CYAN" "单项更新（简略进度）" "$ANSI_RESET")"
-  log "更新 ${tool_name} 中..."
-  run_detailed_with_fallback "更新 ${tool_name}" update-one "$tool_key"
-  log "更新 ${tool_name} 完成。"
-
   raw="$(check_raw)"
   record="$(raw_tool_record "$raw" "$tool_key")"
   if [ -z "$record" ]; then
@@ -904,6 +993,25 @@ run_update_one_compact() {
     return 0
   fi
 
+  IFS='|' read -r _ _ current latest status _ _ <<<"$record"
+  case "$status" in
+    可更新|未安装|不可执行|异常比较结果)
+      log "更新 ${tool_name} 中..."
+      run_detailed_with_fallback "更新 ${tool_name}" update-one "$tool_key"
+      log "更新 ${tool_name} 完成。"
+      ;;
+    *)
+      log "${tool_name} 当前为“${status}”，无需更新，已跳过。"
+      return 0
+      ;;
+  esac
+
+  raw="$(check_raw)"
+  record="$(raw_tool_record "$raw" "$tool_key")"
+  if [ -z "$record" ]; then
+    log "$(color "$ANSI_YELLOW$ANSI_BOLD" "复检：未获取到 ${tool_name} 状态，请执行 check 查看详情。" "$ANSI_RESET")"
+    return 0
+  fi
   IFS='|' read -r _ _ current latest status _ _ <<<"$record"
   log "复检：${tool_name} ${status}（当前 ${current}，最新 ${latest}）。"
 }
