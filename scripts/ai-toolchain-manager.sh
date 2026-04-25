@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 统一管理 Claude / Codex / Gemini：
+# 统一管理 Claude / Codex / Gemini / Kimi：
 # - check：只检查当前版本与最新版本
 # - fix：修复损坏的安装和命令入口
 # - update：升级到最新版本并修复入口
@@ -11,7 +11,7 @@ NPM_CACHE="${NPM_CACHE:-$HOME/.cache/ai-toolchain-npm}"
 NPM_GLOBAL_PREFIX="${NPM_GLOBAL_PREFIX:-$HOME/.npm-global}"
 CLAUDE_PREFIX="${CLAUDE_PREFIX:-$HOME/.claude/local-user}"
 LOCAL_BIN_DIR="${LOCAL_BIN_DIR:-$HOME/.local/bin}"
-SYSTEM_BIN_DIR="${SYSTEM_BIN_DIR:-/opt/homebrew/bin}"
+SYSTEM_BIN_DIR="${SYSTEM_BIN_DIR:-}"
 
 CLAUDE_APP_LINK="$HOME/.claude/local/claude"
 USE_COLOR=0
@@ -38,7 +38,7 @@ color() {
 
 line_color_for_status() {
   case "$1" in
-    已是最新|无需处理)
+    已是最新|已安装|无需处理)
       printf '%s' "$ANSI_GREEN"
       ;;
     本地更新|可更新)
@@ -55,7 +55,7 @@ line_color_for_status() {
 
 status_display_text() {
   case "$1" in
-    已是最新|无需处理)
+    已是最新|已安装|无需处理)
       printf '✓ %s' "$1"
       ;;
     本地更新|可更新)
@@ -142,20 +142,22 @@ card_row() {
 usage() {
   cat <<'EOF'
 用法：
-  scripts/ai-toolchain-manager.sh [snapshot|check|fix|update|all]
+  scripts/ai-toolchain-manager.sh [snapshot|check|fix|update|all|selftest]
 
 说明：
-  snapshot 输出当前三项工具的摘要和建议，适合启动前预览
+  snapshot 输出当前四项工具的摘要和建议，适合启动前预览
   check   只检查当前版本、最新版本和可执行状态
   fix     修复损坏的入口或缺失的安装，不主动升级
   update  升级到最新版本，并修复入口
   all     一键执行：check -> fix -> update -> check
+  selftest  仅执行逻辑回归测试，不安装不更新
 
 可选环境变量：
   NPM_REGISTRY=https://registry.npmjs.org
   NPM_CACHE=~/.cache/ai-toolchain-npm
   NPM_GLOBAL_PREFIX=~/.npm-global
   CLAUDE_PREFIX=~/.claude/local-user
+  SYSTEM_BIN_DIR=/opt/homebrew/bin  # 可选，强制写入系统 bin 目录
 EOF
 }
 
@@ -189,7 +191,7 @@ semver_cmp() {
       return 0
     fi
     if ((10#$ai < 10#$bi)); then
-      printf '-1\n'
+      printf '%s\n' '-1'
       return 0
     fi
   done
@@ -213,6 +215,23 @@ ensure_link() {
   ln -sfn "$target_path" "$link_path"
 }
 
+resolve_system_bin_dir() {
+  if [ -n "$SYSTEM_BIN_DIR" ]; then
+    printf '%s' "$SYSTEM_BIN_DIR"
+    return 0
+  fi
+
+  local d
+  for d in /opt/homebrew/bin /usr/local/bin; do
+    if [ -d "$d" ] && [ -w "$d" ]; then
+      printf '%s' "$d"
+      return 0
+    fi
+  done
+
+  printf ''
+}
+
 probe_tool() {
   local cmd="$1"
   local output version path
@@ -233,6 +252,58 @@ probe_tool() {
   printf 'ok|%s|%s\n' "$path" "$version"
 }
 
+probe_kimi() {
+  local cmd output version path
+  for cmd in kimi kimi-cli; do
+    path="$(command -v "$cmd" 2>/dev/null || true)"
+    if [ -z "$path" ]; then
+      continue
+    fi
+    if ! output="$("$cmd" --version 2>&1)"; then
+      printf 'broken|%s|\n' "$path"
+      return 0
+    fi
+    version="$(extract_version "$output")"
+    if [ -z "$version" ]; then
+      version="-"
+    fi
+    printf 'ok|%s|%s\n' "$path" "$version"
+    return 0
+  done
+  printf 'missing||\n'
+}
+
+latest_kimi_version() {
+  local version=""
+
+  if command -v python3 >/dev/null 2>&1; then
+    version="$(
+      python3 - <<'PY' 2>/dev/null
+import json
+import urllib.request
+
+try:
+    with urllib.request.urlopen("https://pypi.org/pypi/kimi-cli/json", timeout=8) as resp:
+        data = json.load(resp)
+    print((data.get("info") or {}).get("version", ""))
+except Exception:
+    pass
+PY
+    )"
+  fi
+
+  if [ -z "$version" ]; then
+    version="$(
+      curl -fsSL https://pypi.org/pypi/kimi-cli/json 2>/dev/null \
+        | tr -d '\n' \
+        | sed -n 's/.*"version":"\([0-9][0-9.]*\)".*/\1/p' \
+        | head -n 1
+    )"
+  fi
+
+  printf '%s' "$version"
+}
+
 status_and_tip() {
   local state="$1"
   local current="$2"
@@ -245,7 +316,7 @@ status_and_tip() {
         0) printf '已是最新|无需处理\n' ;;
         1) printf '本地更新|可保留当前版本\n' ;;
         -1) printf '可更新|建议执行 update\n' ;;
-        *) printf '未知|先执行 check\n' ;;
+        *) printf '异常比较结果|建议执行 selftest\n' ;;
       esac
       ;;
     broken)
@@ -258,6 +329,102 @@ status_and_tip() {
       printf '未知|建议先执行 check\n'
       ;;
   esac
+}
+
+status_and_tip_kimi() {
+  local state="$1"
+  local current="${2:-}"
+  local latest="${3:-}"
+  local cmp
+  case "$state" in
+    ok)
+      if [ -n "$current" ] && [ "$current" != "-" ] && [ -n "$latest" ] && [ "$latest" != "-" ]; then
+        cmp="$(semver_cmp "$current" "$latest")"
+        case "$cmp" in
+          0) printf '已是最新|无需处理\n' ;;
+          1) printf '本地更新|可保留当前版本\n' ;;
+          -1) printf '可更新|建议执行 update\n' ;;
+          *) printf '异常比较结果|建议执行 selftest\n' ;;
+        esac
+      else
+        printf '已安装|可执行，update 会重装最新版\n'
+      fi
+      ;;
+    broken)
+      printf '不可执行|建议先执行 fix\n'
+      ;;
+    missing)
+      printf '未安装|建议先执行 fix\n'
+      ;;
+    *)
+      printf '未知|建议先执行 check\n'
+      ;;
+  esac
+}
+
+install_kimi() {
+  local mode="${1:-fix}"
+
+  if [ "$mode" = "update" ] && command -v uv >/dev/null 2>&1; then
+    if uv tool upgrade kimi-cli >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  curl -fsSL https://code.kimi.com/install.sh | bash >/dev/null 2>&1
+}
+
+selftest() {
+  local failed=0
+  local out
+
+  out="$(semver_cmp "0.124.0" "0.125.0")"
+  if [ "$out" = "-1" ]; then
+    log "PASS semver_cmp 0.124.0 < 0.125.0"
+  else
+    log "FAIL semver_cmp 0.124.0 < 0.125.0 (got: $out)"
+    failed=1
+  fi
+
+  out="$(status_and_tip "ok" "0.124.0" "0.125.0")"
+  if [ "${out%%|*}" = "可更新" ]; then
+    log "PASS status_and_tip 可更新"
+  else
+    log "FAIL status_and_tip 可更新 (got: $out)"
+    failed=1
+  fi
+
+  out="$(status_and_tip "ok" "0.125.0" "0.125.0")"
+  if [ "${out%%|*}" = "已是最新" ]; then
+    log "PASS status_and_tip 已是最新"
+  else
+    log "FAIL status_and_tip 已是最新 (got: $out)"
+    failed=1
+  fi
+
+  out="$(status_and_tip_kimi "ok" "1.37.0" "1.38.0")"
+  if [ "${out%%|*}" = "可更新" ]; then
+    log "PASS status_and_tip_kimi 可更新"
+  else
+    log "FAIL status_and_tip_kimi 可更新 (got: $out)"
+    failed=1
+  fi
+
+  out="$(status_and_tip_kimi "ok" "1.38.0" "1.38.0")"
+  if [ "${out%%|*}" = "已是最新" ]; then
+    log "PASS status_and_tip_kimi 已是最新"
+  else
+    log "FAIL status_and_tip_kimi 已是最新 (got: $out)"
+    failed=1
+  fi
+
+  if [ "$failed" -eq 0 ]; then
+    log "SELFTEST OK"
+    return 0
+  fi
+
+  log "SELFTEST FAILED"
+  return 1
 }
 
 ensure_claude_native() {
@@ -320,17 +487,24 @@ EOF
 }
 
 ensure_links() {
-  mkdir -p "$LOCAL_BIN_DIR" "$SYSTEM_BIN_DIR" "$(dirname "$CLAUDE_APP_LINK")"
+  local effective_system_bin
+  effective_system_bin="$(resolve_system_bin_dir)"
+
+  mkdir -p "$LOCAL_BIN_DIR" "$(dirname "$CLAUDE_APP_LINK")"
 
   write_claude_wrapper
   ensure_link "$LOCAL_BIN_DIR/claude" "$CLAUDE_APP_LINK"
-  ensure_link "$SYSTEM_BIN_DIR/claude" "$CLAUDE_APP_LINK"
-
   ensure_link "$LOCAL_BIN_DIR/codex" "$NPM_GLOBAL_PREFIX/bin/codex"
-  ensure_link "$SYSTEM_BIN_DIR/codex" "$NPM_GLOBAL_PREFIX/bin/codex"
-
   ensure_link "$LOCAL_BIN_DIR/gemini" "$NPM_GLOBAL_PREFIX/bin/gemini"
-  ensure_link "$SYSTEM_BIN_DIR/gemini" "$NPM_GLOBAL_PREFIX/bin/gemini"
+
+  if [ -n "$effective_system_bin" ]; then
+    mkdir -p "$effective_system_bin" 2>/dev/null || true
+    if [ -w "$effective_system_bin" ]; then
+      ensure_link "$effective_system_bin/claude" "$CLAUDE_APP_LINK"
+      ensure_link "$effective_system_bin/codex" "$NPM_GLOBAL_PREFIX/bin/codex"
+      ensure_link "$effective_system_bin/gemini" "$NPM_GLOBAL_PREFIX/bin/gemini"
+    fi
+  fi
 }
 
 check_one() {
@@ -365,6 +539,33 @@ check_one() {
   log "$(color "$row_color" "$row" "$ANSI_RESET")"
 }
 
+check_one_kimi() {
+  local probe state path version latest result status tip row row_color
+
+  probe="$(probe_kimi)"
+  state="${probe%%|*}"
+  path="${probe#*|}"
+  path="${path%%|*}"
+  version="${probe##*|}"
+  latest="$(latest_kimi_version)"
+
+  result="$(status_and_tip_kimi "$state" "$version" "$latest")"
+  status="${result%%|*}"
+  tip="${result#*|}"
+
+  row="$(
+    printf '%s %s %s %s %s %s' \
+      "$(pad_display "Kimi" 8)" \
+      "$(pad_display "${version:--}" 18)" \
+      "$(pad_display "${latest:--}" 18)" \
+      "$(pad_display "$(status_display_text "$status")" 12)" \
+      "$(pad_display "$tip" 18)" \
+      "${path:--}"
+  )"
+  row_color="$(line_color_for_status "$status")"
+  log "$(color "$row_color" "$row" "$ANSI_RESET")"
+}
+
 snapshot_one() {
   local display_name="$1"
   local cmd_name="$2"
@@ -383,6 +584,23 @@ snapshot_one() {
   tip="${result#*|}"
 
   render_snapshot_card "$display_name" "${version:--}" "${latest:--}" "$status" "$tip"
+}
+
+snapshot_one_kimi() {
+  local probe state path version latest status tip result
+
+  probe="$(probe_kimi)"
+  state="${probe%%|*}"
+  path="${probe#*|}"
+  path="${path%%|*}"
+  version="${probe##*|}"
+  latest="$(latest_kimi_version)"
+
+  result="$(status_and_tip_kimi "$state" "$version" "$latest")"
+  status="${result%%|*}"
+  tip="${result#*|}"
+
+  render_snapshot_card "Kimi" "${version:--}" "${latest:--}" "$status" "$tip"
 }
 
 render_snapshot_card() {
@@ -449,10 +667,22 @@ repair_or_update_one() {
   fi
 }
 
+repair_or_update_kimi() {
+  local mode="${1:-fix}"
+  local current_state
+
+  current_state="$(probe_kimi)"
+  current_state="${current_state%%|*}"
+
+  if [ "$mode" = "update" ] || [ "$current_state" != "ok" ]; then
+    install_kimi "$mode"
+  fi
+}
+
 main() {
   local mode="${1:-check}"
   case "$mode" in
-    snapshot|check|fix|update|all) ;;
+    snapshot|check|fix|update|all|selftest) ;;
     -h|--help|help)
       usage
       exit 0
@@ -470,6 +700,11 @@ main() {
   require_cmd python3
 
   mkdir -p "$NPM_CACHE" "$NPM_GLOBAL_PREFIX" "$CLAUDE_PREFIX"
+
+  if [ "$mode" = "selftest" ]; then
+    selftest
+    return $?
+  fi
 
   if [ "$mode" = "all" ]; then
     log "$(color "$ANSI_BOLD$ANSI_CYAN" "一键全量处理：check -> fix -> update -> check" "$ANSI_RESET")"
@@ -496,6 +731,7 @@ main() {
     snapshot_one "Claude" "claude" "@anthropic-ai/claude-code"
     snapshot_one "Codex" "codex" "@openai/codex"
     snapshot_one "Gemini" "gemini" "@google/gemini-cli"
+    snapshot_one_kimi
     return 0
   fi
 
@@ -523,6 +759,7 @@ main() {
   check_one "Claude" "claude" "@anthropic-ai/claude-code" "$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code"
   check_one "Codex" "codex" "@openai/codex" "$NPM_GLOBAL_PREFIX/lib/node_modules/@openai/codex"
   check_one "Gemini" "gemini" "@google/gemini-cli" "$NPM_GLOBAL_PREFIX/lib/node_modules/@google/gemini-cli"
+  check_one_kimi
 
   if [ "$mode" = "check" ]; then
     return 0
@@ -534,6 +771,7 @@ main() {
   repair_or_update_one "Claude" "claude" "@anthropic-ai/claude-code" "$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code" "$mode"
   repair_or_update_one "Codex" "codex" "@openai/codex" "$NPM_GLOBAL_PREFIX/lib/node_modules/@openai/codex" "$mode"
   repair_or_update_one "Gemini" "gemini" "@google/gemini-cli" "$NPM_GLOBAL_PREFIX/lib/node_modules/@google/gemini-cli" "$mode"
+  repair_or_update_kimi "$mode"
   ensure_links
 
   log ""
@@ -559,6 +797,7 @@ main() {
   check_one "Claude" "claude" "@anthropic-ai/claude-code" "$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code"
   check_one "Codex" "codex" "@openai/codex" "$NPM_GLOBAL_PREFIX/lib/node_modules/@openai/codex"
   check_one "Gemini" "gemini" "@google/gemini-cli" "$NPM_GLOBAL_PREFIX/lib/node_modules/@google/gemini-cli"
+  check_one_kimi
 }
 
 main "$@"
