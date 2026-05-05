@@ -9,6 +9,10 @@ set -euo pipefail
 NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmjs.org}"
 NPM_CACHE="${NPM_CACHE:-$HOME/.cache/ai-toolchain-npm}"
 NPM_GLOBAL_PREFIX="${NPM_GLOBAL_PREFIX:-$HOME/.npm-global}"
+NPM_FETCH_RETRIES="${NPM_FETCH_RETRIES:-1}"
+NPM_FETCH_RETRY_MINTIMEOUT="${NPM_FETCH_RETRY_MINTIMEOUT:-1000}"
+NPM_FETCH_RETRY_MAXTIMEOUT="${NPM_FETCH_RETRY_MAXTIMEOUT:-4000}"
+NPM_FETCH_TIMEOUT="${NPM_FETCH_TIMEOUT:-8000}"
 CLAUDE_PREFIX="${CLAUDE_PREFIX:-$HOME/.claude/local-user}"
 LOCAL_BIN_DIR="${LOCAL_BIN_DIR:-$HOME/.local/bin}"
 SYSTEM_BIN_DIR="${SYSTEM_BIN_DIR:-}"
@@ -41,7 +45,7 @@ line_color_for_status() {
     已是最新|已安装|无需处理)
       printf '%s' "$ANSI_GREEN"
       ;;
-    本地更新|可更新)
+    本地更新|可更新|无法检查|异常比较结果)
       printf '%s' "$ANSI_YELLOW"
       ;;
     不可执行|未安装)
@@ -101,7 +105,7 @@ pad_display() {
   local text="$1"
   local target_width="$2"
   local align="${3:-left}"
-  local actual_width pad_count pad_char
+  local actual_width pad_count
 
   actual_width="$(display_width "$text")"
   if [ "$actual_width" -ge "$target_width" ]; then
@@ -110,7 +114,6 @@ pad_display() {
   fi
 
   pad_count=$((target_width - actual_width))
-  pad_char=' '
   if [ "$align" = "right" ]; then
     printf '%*s%s' "$pad_count" '' "$text"
   else
@@ -206,7 +209,36 @@ semver_cmp() {
 
 latest_version() {
   local pkg="$1"
-  npm view "${pkg}" version --registry "$NPM_REGISTRY" 2>/dev/null | tail -n 1 | tr -d '[:space:]'
+  local output
+  if ! output="$(
+    npm \
+      --fetch-retries="$NPM_FETCH_RETRIES" \
+      --fetch-retry-mintimeout="$NPM_FETCH_RETRY_MINTIMEOUT" \
+      --fetch-retry-maxtimeout="$NPM_FETCH_RETRY_MAXTIMEOUT" \
+      --fetch-timeout="$NPM_FETCH_TIMEOUT" \
+      view "${pkg}" version --registry "$NPM_REGISTRY" 2>/dev/null
+  )"; then
+    printf ''
+    return 0
+  fi
+  printf '%s\n' "$output" | tail -n 1 | tr -d '[:space:]'
+}
+
+latest_tarball() {
+  local pkg="$1"
+  local output
+  if ! output="$(
+    npm \
+      --fetch-retries="$NPM_FETCH_RETRIES" \
+      --fetch-retry-mintimeout="$NPM_FETCH_RETRY_MINTIMEOUT" \
+      --fetch-retry-maxtimeout="$NPM_FETCH_RETRY_MAXTIMEOUT" \
+      --fetch-timeout="$NPM_FETCH_TIMEOUT" \
+      view "$pkg" dist.tarball --registry "$NPM_REGISTRY" 2>/dev/null
+  )"; then
+    printf ''
+    return 0
+  fi
+  printf '%s\n' "$output" | tail -n 1 | tr -d '[:space:]'
 }
 
 installed_pkg_version() {
@@ -305,12 +337,14 @@ PY
   fi
 
   if [ -z "$version" ]; then
-    version="$(
-      curl -fsSL https://pypi.org/pypi/kimi-cli/json 2>/dev/null \
+    if ! version="$(
+      curl --retry 2 --retry-delay 2 --connect-timeout 10 --max-time 20 -fsSL https://pypi.org/pypi/kimi-cli/json 2>/dev/null \
         | tr -d '\n' \
         | sed -n 's/.*"version":"\([0-9][0-9.]*\)".*/\1/p' \
         | head -n 1
-    )"
+    )"; then
+      version=""
+    fi
   fi
 
   printf '%s' "$version"
@@ -323,6 +357,10 @@ status_and_tip() {
   local cmp
   case "$state" in
     ok)
+      if [ -z "$latest" ] || [ "$latest" = "-" ]; then
+        printf '无法检查|请检查网络或 registry\n'
+        return 0
+      fi
       cmp="$(semver_cmp "$current" "$latest")"
       case "$cmp" in
         0) printf '已是最新|无需处理\n' ;;
@@ -350,7 +388,9 @@ status_and_tip_kimi() {
   local cmp
   case "$state" in
     ok)
-      if [ -n "$current" ] && [ "$current" != "-" ] && [ -n "$latest" ] && [ "$latest" != "-" ]; then
+      if [ -z "$latest" ] || [ "$latest" = "-" ]; then
+        printf '无法检查|请检查网络或 PyPI\n'
+      elif [ -n "$current" ] && [ "$current" != "-" ]; then
         cmp="$(semver_cmp "$current" "$latest")"
         case "$cmp" in
           0) printf '已是最新|无需处理\n' ;;
@@ -383,7 +423,7 @@ install_kimi() {
     fi
   fi
 
-  curl -fsSL https://code.kimi.com/install.sh | bash >/dev/null 2>&1
+  curl --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 -fsSL https://code.kimi.com/install.sh | bash >/dev/null 2>&1
 }
 
 selftest() {
@@ -414,6 +454,14 @@ selftest() {
     failed=1
   fi
 
+  out="$(status_and_tip "ok" "0.125.0" "")"
+  if [ "${out%%|*}" = "无法检查" ]; then
+    log "PASS status_and_tip 无法检查"
+  else
+    log "FAIL status_and_tip 无法检查 (got: $out)"
+    failed=1
+  fi
+
   out="$(status_and_tip_kimi "ok" "1.37.0" "1.38.0")"
   if [ "${out%%|*}" = "可更新" ]; then
     log "PASS status_and_tip_kimi 可更新"
@@ -430,6 +478,22 @@ selftest() {
     failed=1
   fi
 
+  out="$(status_and_tip_kimi "ok" "1.38.0" "")"
+  if [ "${out%%|*}" = "无法检查" ]; then
+    log "PASS status_and_tip_kimi 无法检查"
+  else
+    log "FAIL status_and_tip_kimi 无法检查 (got: $out)"
+    failed=1
+  fi
+
+  out="$(raw_metrics "claude|Claude|2.1.128|-|无法检查|请检查网络或 registry|/tmp/claude")"
+  if [ "$out" = "1|0|0|1" ]; then
+    log "PASS raw_metrics 无法检查计为异常"
+  else
+    log "FAIL raw_metrics 无法检查计为异常 (got: $out)"
+    failed=1
+  fi
+
   if [ "$failed" -eq 0 ]; then
     log "SELFTEST OK"
     return 0
@@ -443,40 +507,85 @@ ensure_claude_native() {
   local version="$1"
   local native_dir="$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-darwin-arm64"
   local native_bin="$native_dir/claude"
+  local sibling_native_bin="$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code-darwin-arm64/claude"
   if [ -x "$native_bin" ]; then
+    return 0
+  fi
+  if [ -x "$sibling_native_bin" ]; then
     return 0
   fi
 
   local tarball tmpdir
-  tarball="$(npm view "@anthropic-ai/claude-code-darwin-arm64@${version}" dist.tarball --registry "$NPM_REGISTRY" 2>/dev/null | tail -n 1 | tr -d '[:space:]')"
-  [ -n "$tarball" ] || die "无法获取 Claude 原生包的 tarball 地址：${version}"
+  tarball="$(latest_tarball "@anthropic-ai/claude-code-darwin-arm64@${version}")"
+  if [ -z "$tarball" ]; then
+    printf '错误：无法获取 Claude 原生包的 tarball 地址：%s\n' "$version" >&2
+    return 1
+  fi
 
   tmpdir="$(mktemp -d)"
   mkdir -p "$native_dir"
-  curl -fsSL "$tarball" -o "$tmpdir/pkg.tgz"
+  if ! curl --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 -fsSL "$tarball" -o "$tmpdir/pkg.tgz"; then
+    rm -rf "$tmpdir"
+    return 1
+  fi
   rm -rf "$native_dir"
   mkdir -p "$native_dir"
-  tar -xzf "$tmpdir/pkg.tgz" -C "$native_dir" --strip-components=1
+  if ! tar -xzf "$tmpdir/pkg.tgz" -C "$native_dir" --strip-components=1; then
+    rm -rf "$tmpdir"
+    return 1
+  fi
   chmod 755 "$native_bin"
   rm -rf "$tmpdir"
 }
 
 install_claude() {
   local version="$1"
+  local package_dir="$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code"
+  local native_dir="$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code-darwin-arm64"
+  local backup_dir backup_package backup_native exit_code
+  [ -n "$version" ] || die "无法获取 Claude 最新版本，已跳过更新以保护现有安装。"
+
   mkdir -p "$CLAUDE_PREFIX"
   if [ ! -f "$CLAUDE_PREFIX/package.json" ]; then
     (cd "$CLAUDE_PREFIX" && npm init -y >/dev/null)
   fi
 
-  rm -rf "$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code"
-  (cd "$CLAUDE_PREFIX" && npm install "@anthropic-ai/claude-code@${version}" --registry "$NPM_REGISTRY" --cache "$NPM_CACHE" >/dev/null)
-  ensure_claude_native "$version"
-  (cd "$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code" && node install.cjs >/dev/null)
+  backup_dir="$(mktemp -d)"
+  backup_package="$backup_dir/claude-code"
+  backup_native="$backup_dir/claude-code-darwin-arm64"
+  if [ -e "$package_dir" ]; then
+    cp -R "$package_dir" "$backup_package"
+  fi
+  if [ -e "$native_dir" ]; then
+    cp -R "$native_dir" "$backup_native"
+  fi
+
+  if (cd "$CLAUDE_PREFIX" && npm install "@anthropic-ai/claude-code@${version}" --registry "$NPM_REGISTRY" --cache "$NPM_CACHE" >/dev/null) \
+    && ensure_claude_native "$version" \
+    && (cd "$package_dir" && node install.cjs >/dev/null); then
+    rm -rf "$backup_dir"
+    return 0
+  fi
+
+  exit_code=$?
+  rm -rf "$package_dir" "$native_dir"
+  if [ -e "$backup_package" ]; then
+    mkdir -p "$(dirname "$package_dir")"
+    cp -R "$backup_package" "$package_dir"
+  fi
+  if [ -e "$backup_native" ]; then
+    mkdir -p "$(dirname "$native_dir")"
+    cp -R "$backup_native" "$native_dir"
+  fi
+  rm -rf "$backup_dir"
+  printf '错误：Claude 更新失败，已回滚到更新前的本地安装。\n' >&2
+  return "$exit_code"
 }
 
 install_global_pkg() {
   local pkg="$1"
   local version="$2"
+  [ -n "$version" ] || die "无法获取 ${pkg} 最新版本，已跳过更新以保护现有安装。"
   npm install -g "${pkg}@${version}" --prefix "$NPM_GLOBAL_PREFIX" --registry "$NPM_REGISTRY" --cache "$NPM_CACHE" >/dev/null
 }
 
@@ -937,9 +1046,13 @@ run_all_compact() {
   if [ "$fix_count" -eq 0 ] && [ "$update_count" -eq 0 ]; then
     log "[2/4] 无需修复，已跳过。"
     log "[3/4] 无需更新，已跳过。"
-    log "[4/4] 复检完成：可更新 0 项，异常 0 项。"
-    log "$(color "$ANSI_GREEN$ANSI_BOLD" "结果：全部已是最新，已跳过升级动作。" "$ANSI_RESET")"
-    return 0
+    log "[4/4] 复检完成：可更新 ${before_updatable} 项，异常 ${before_issue} 项。"
+    if [ "$before_issue" -eq 0 ]; then
+      log "$(color "$ANSI_GREEN$ANSI_BOLD" "结果：全部已是最新，已跳过升级动作。" "$ANSI_RESET")"
+      return 0
+    fi
+    log "$(color "$ANSI_YELLOW$ANSI_BOLD" "结果：存在检查异常，请查看网络、registry 或工具状态。" "$ANSI_RESET")"
+    return 1
   fi
 
   if [ "$fix_count" -gt 0 ]; then
@@ -987,8 +1100,10 @@ run_all_compact() {
   log "[4/4] 复检完成：可更新 ${final_updatable} 项，异常 ${final_issue} 项。"
   if [ "$final_updatable" -eq 0 ] && [ "$final_issue" -eq 0 ]; then
     log "$(color "$ANSI_GREEN$ANSI_BOLD" "结果：全部已是最新，且无异常。" "$ANSI_RESET")"
+    return 0
   else
     log "$(color "$ANSI_YELLOW$ANSI_BOLD" "结果：仍有待处理项（可更新 ${final_updatable}，异常 ${final_issue}）。" "$ANSI_RESET")"
+    return 1
   fi
 }
 
@@ -1013,6 +1128,10 @@ run_update_one_compact() {
       run_detailed_with_fallback "更新 ${tool_name}" update-one "$tool_key"
       log "更新 ${tool_name} 完成。"
       ;;
+    无法检查)
+      log "${tool_name} 暂时无法检查最新版本，请确认网络或 registry 后再更新。"
+      return 1
+      ;;
     *)
       log "${tool_name} 当前为“${status}”，无需更新，已跳过。"
       return 0
@@ -1033,6 +1152,7 @@ main() {
   local mode="${1:-check}"
   local target_tool=""
   local compact=0
+  local compact_status=0
   local arg
   local -a extra_args=()
 
@@ -1071,6 +1191,10 @@ main() {
       die "update-one 参数过多：${extra_args[*]}"
     fi
     target_tool="$(printf '%s' "${extra_args[0]}" | tr '[:upper:]' '[:lower:]')"
+    case "$target_tool" in
+      claude|codex|gemini|kimi) ;;
+      *) die "update-one 仅支持：claude|codex|gemini|kimi" ;;
+    esac
   else
     if [ "${#extra_args[@]}" -gt 0 ]; then
       die "未知参数：${extra_args[*]}"
@@ -1097,7 +1221,10 @@ main() {
 
   if [ "$mode" = "all" ]; then
     if [ "$compact" -eq 1 ]; then
-      run_all_compact
+      run_all_compact || {
+        compact_status=$?
+        return "$compact_status"
+      }
       return 0
     fi
 
@@ -1121,7 +1248,10 @@ main() {
 
   if [ "$mode" = "update-one" ]; then
     if [ "$compact" -eq 1 ]; then
-      run_update_one_compact "$target_tool"
+      run_update_one_compact "$target_tool" || {
+        compact_status=$?
+        return "$compact_status"
+      }
       return 0
     fi
 

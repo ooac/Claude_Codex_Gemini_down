@@ -21,14 +21,16 @@ normalize_mode() {
 
 run_mode() {
   local mode="$1"
+  local exit_code
   shift || true
   if "$SCRIPT_PATH" "$mode" "$@"; then
     printf '\n执行完成。\n'
     return 0
+  else
+    exit_code=$?
+    printf '\n执行失败（exit=%s）。\n' "$exit_code"
+    return "$exit_code"
   fi
-  local exit_code=$?
-  printf '\n执行失败（exit=%s）。\n' "$exit_code"
-  return "$exit_code"
 }
 
 render_snapshot() {
@@ -85,6 +87,10 @@ should_run_single_update() {
       ;;
     "")
       printf '%s 当前状态未知，已跳过更新。\n' "$name"
+      return 1
+      ;;
+    无法检查)
+      printf '%s 暂时无法检查最新版本，请确认网络或 registry 后再更新。\n' "$name"
       return 1
       ;;
     *)

@@ -56,6 +56,7 @@ chmod +x ai-toolchain-manager.command scripts/ai-toolchain-manager.sh
 
 ```bash
 chmod +x ai-toolchain-manager.command
+xattr -d com.apple.quarantine ai-toolchain-manager.command 2>/dev/null || true
 ./ai-toolchain-manager.command
 ```
 
