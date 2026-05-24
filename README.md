@@ -4,7 +4,7 @@
 
 - Claude
 - Codex
-- Gemini
+- Antigravity
 - Kimi
 
 ## 使用方式
@@ -12,19 +12,29 @@
 双击 `ai-toolchain-manager.command` 后会先显示摘要，然后进入终端菜单：
 
 - 直接回车：一键全量处理（`check -> fix -> update -> check`，简略进度输出）
-- 输入 `1/2/3/4`：单项升级（Claude/Codex/Gemini/Kimi，简略进度输出）
+- 输入 `1/2/3/4`：单项升级（Claude/Codex/Antigravity/Kimi，简略进度输出）
 - 输入 `c`：只检查
 - 输入 `f`：修复异常
+- 输入 `g`：彻底卸载 Gemini CLI
 - 输入 `q`：退出
 
-`update` 是批量更新，一次会处理 Claude、Codex、Gemini、Kimi 四项。
+`update` 是批量更新，一次会处理 Claude、Codex、Antigravity、Kimi 四项。
 `all` 是一键搞定模式，直接把常见问题全流程跑完。
 `all --compact` 与 `update-one --compact` 只显示阶段进度和简要结论；已是最新项会自动跳过，不再重复执行更新。`check/fix/update` 默认保持详细输出，便于排障。
 `ai-toolchain-manager.command` 使用动态目录定位，不依赖固定用户路径。
 
 Kimi 的安装/更新来源：`curl -L code.kimi.com/install.sh | bash`
+Antigravity 的安装来源：`curl -fsSL https://antigravity.google/cli/install.sh | bash`
+Antigravity 的版本检测命令：`agy --version`
 
 启动时会先显示当前四项工具的摘要，执行后会继续在终端里显示结果。当前版本不再生成 HTML 报告，也不再额外写日志文件。
+
+`g`（或命令 `uninstall-gemini`）会清理：
+- Gemini CLI npm 全局包（`@google/gemini-cli`，覆盖 `NPM_GLOBAL_PREFIX` 与 `npm config get prefix`）
+- 常见 Gemini 命令入口（`~/.local/bin/gemini`、`/opt/homebrew/bin/gemini`、`/usr/local/bin/gemini`）
+- 用户目录 `~/.gemini`
+- VS Code Gemini 相关扩展目录（`google.geminicodeassist-*`、`google.gemini-cli-vscode-ide-companion-*`）
+- 如遇权限不足，会提示输入 sudo 密码继续删除残留
 
 ## 复制到其他电脑
 
@@ -50,6 +60,9 @@ chmod +x ai-toolchain-manager.command scripts/ai-toolchain-manager.sh
 ./scripts/ai-toolchain-manager.sh check-raw
 ./scripts/ai-toolchain-manager.sh update-one codex
 ./scripts/ai-toolchain-manager.sh update-one codex --compact
+./scripts/ai-toolchain-manager.sh update-one antigravity
+./scripts/ai-toolchain-manager.sh update-one antigravity --compact
+./scripts/ai-toolchain-manager.sh uninstall-gemini
 ```
 
 如果只想双击运行：

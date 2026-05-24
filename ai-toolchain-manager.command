@@ -11,6 +11,7 @@ normalize_mode() {
     "一键搞定"|"auto"|"all") printf 'all' ;;
     "检查"|"check"|"c") printf 'check' ;;
     "修复"|"fix"|"f") printf 'fix' ;;
+    "卸载Gemini"|"uninstall-gemini"|"g") printf 'uninstall-gemini' ;;
     "更新"|"update"|"u") printf 'update' ;;
     "快照"|"snapshot"|"s") printf 'snapshot' ;;
     "自测"|"selftest"|"t") printf 'selftest' ;;
@@ -49,7 +50,7 @@ render_update_hint() {
       case "$key" in
         claude) item="1 ${name} ${current} -> ${latest}" ;;
         codex) item="2 ${name} ${current} -> ${latest}" ;;
-        gemini) item="3 ${name} ${current} -> ${latest}" ;;
+        antigravity) item="3 ${name} ${current} -> ${latest}" ;;
         kimi) item="4 ${name} ${current} -> ${latest}" ;;
         *) item="" ;;
       esac
@@ -108,9 +109,9 @@ run_interactive_menu() {
     printf '  [回车] 一键升级全部（check -> fix -> update -> check）\n'
     printf '  [1] 仅升级 Claude\n'
     printf '  [2] 仅升级 Codex\n'
-    printf '  [3] 仅升级 Gemini\n'
+    printf '  [3] 仅升级 Antigravity\n'
     printf '  [4] 仅升级 Kimi\n'
-    printf '  [c] 仅检查   [f] 修复异常   [q] 退出\n'
+    printf '  [c] 仅检查   [f] 修复异常   [g] 卸载 Gemini   [q] 退出\n'
     printf '请输入：'
     if ! read -r input; then
       input="q"
@@ -135,8 +136,8 @@ run_interactive_menu() {
         render_snapshot
         ;;
       "3")
-        if should_run_single_update "gemini" "Gemini"; then
-          run_mode update-one gemini --compact || true
+        if should_run_single_update "antigravity" "Antigravity"; then
+          run_mode update-one antigravity --compact || true
         fi
         printf '\n'
         render_snapshot
@@ -158,12 +159,16 @@ run_interactive_menu() {
         printf '\n'
         render_snapshot
         ;;
+      "g"|"G")
+        run_mode uninstall-gemini || true
+        printf '\n'
+        ;;
       "q"|"Q"|"quit"|"取消")
         printf '已取消。\n'
         break
         ;;
       *)
-        printf '无效输入，请输入回车/1/2/3/4/c/f/q。\n\n'
+        printf '无效输入，请输入回车/1/2/3/4/c/f/g/q。\n\n'
         ;;
     esac
   done

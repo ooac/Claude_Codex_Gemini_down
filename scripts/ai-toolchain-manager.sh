@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 统一管理 Claude / Codex / Gemini / Kimi：
+# 统一管理 Claude / Codex / Antigravity / Kimi：
 # - check：只检查当前版本与最新版本
 # - fix：修复损坏的安装和命令入口
 # - update：升级到最新版本并修复入口
@@ -145,10 +145,11 @@ card_row() {
 usage() {
   cat <<'EOF'
 用法：
-  scripts/ai-toolchain-manager.sh [snapshot|check|fix|update|all|selftest|check-raw|update-one]
-  scripts/ai-toolchain-manager.sh update-one [claude|codex|gemini|kimi]
+  scripts/ai-toolchain-manager.sh [snapshot|check|fix|update|all|selftest|check-raw|update-one|uninstall-gemini]
+  scripts/ai-toolchain-manager.sh update-one [claude|codex|antigravity|kimi]
   scripts/ai-toolchain-manager.sh all --compact
   scripts/ai-toolchain-manager.sh update-one codex --compact
+  scripts/ai-toolchain-manager.sh uninstall-gemini
 
 说明：
   snapshot 输出当前四项工具的摘要和建议，适合启动前预览
@@ -157,6 +158,7 @@ usage() {
   fix     修复损坏的入口或缺失的安装，不主动升级
   update  升级到最新版本，并修复入口
   update-one 仅更新单个工具
+  uninstall-gemini 彻底卸载 Gemini CLI（含用户数据目录）
   all     一键执行：check -> fix -> update -> check
   selftest  仅执行逻辑回归测试，不安装不更新
   --compact 仅输出简略进度（建议用于 all / update-one）
@@ -241,6 +243,57 @@ latest_tarball() {
   printf '%s\n' "$output" | tail -n 1 | tr -d '[:space:]'
 }
 
+antigravity_platform_key() {
+  local os arch
+  case "$(uname -s)" in
+    Darwin) os="darwin" ;;
+    Linux) os="linux" ;;
+    *)
+      printf ''
+      return 0
+      ;;
+  esac
+
+  case "$(uname -m)" in
+    x86_64|amd64) arch="amd64" ;;
+    arm64|aarch64) arch="arm64" ;;
+    *)
+      printf ''
+      return 0
+      ;;
+  esac
+
+  printf '%s_%s' "$os" "$arch"
+}
+
+latest_antigravity_version() {
+  local platform manifest_url payload version
+  platform="$(antigravity_platform_key)"
+  if [ -z "$platform" ]; then
+    printf ''
+    return 0
+  fi
+
+  manifest_url="https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/${platform}.json"
+  payload="$(
+    curl -fsSL --connect-timeout 5 --max-time 15 --retry 2 --retry-delay 1 "$manifest_url" 2>/dev/null || true
+  )"
+
+  if [ -z "$payload" ] && command -v wget >/dev/null 2>&1; then
+    payload="$(wget -q -T 15 -O - "$manifest_url" 2>/dev/null || true)"
+  fi
+
+  if [ -z "$payload" ]; then
+    printf ''
+    return 0
+  fi
+
+  # 使用 awk 解析 JSON 字段，避免 BSD sed 的 BRE 兼容差异导致提取失败。
+  version="$(printf '%s\n' "$payload" | awk -F'"' '/"version"[[:space:]]*:/ {print $4; exit}')"
+
+  printf '%s' "$version"
+}
+
 installed_pkg_version() {
   local path="$1"
   node -p "require('${path}/package.json').version" 2>/dev/null || true
@@ -315,6 +368,28 @@ probe_kimi() {
     return 0
   done
   printf 'missing||\n'
+}
+
+probe_antigravity() {
+  local output version path
+  path="$(command -v agy 2>/dev/null || true)"
+  if [ -z "$path" ] && [ -x "$HOME/.local/bin/agy" ]; then
+    path="$HOME/.local/bin/agy"
+  fi
+  if [ -z "$path" ]; then
+    printf 'missing||\n'
+    return 0
+  fi
+  if ! output="$("$path" --version 2>&1)"; then
+    printf 'broken|%s|\n' "$path"
+    return 0
+  fi
+  version="$(extract_version "$output")"
+  if [ -z "$version" ]; then
+    printf 'broken|%s|\n' "$path"
+    return 0
+  fi
+  printf 'ok|%s|%s\n' "$path" "$version"
 }
 
 latest_kimi_version() {
@@ -414,6 +489,37 @@ status_and_tip_kimi() {
   esac
 }
 
+status_and_tip_antigravity() {
+  local state="$1"
+  local current="${2:-}"
+  local latest="${3:-}"
+  local cmp
+  case "$state" in
+    ok)
+      if [ -n "$current" ] && [ "$current" != "-" ] && [ -n "$latest" ] && [ "$latest" != "-" ]; then
+        cmp="$(semver_cmp "$current" "$latest")"
+        case "$cmp" in
+          0) printf '已是最新|无需处理\n' ;;
+          1) printf '本地更新|可保留当前版本\n' ;;
+          -1) printf '可更新|建议执行 update\n' ;;
+          *) printf '异常比较结果|建议执行 selftest\n' ;;
+        esac
+      else
+        printf '已安装|可执行，尝试update\n'
+      fi
+      ;;
+    broken)
+      printf '不可执行|建议先执行 fix\n'
+      ;;
+    missing)
+      printf '未安装|建议先执行 fix\n'
+      ;;
+    *)
+      printf '未知|建议先执行 check\n'
+      ;;
+  esac
+}
+
 install_kimi() {
   local mode="${1:-fix}"
 
@@ -424,6 +530,224 @@ install_kimi() {
   fi
 
   curl --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 -fsSL https://code.kimi.com/install.sh | bash >/dev/null 2>&1
+}
+
+install_antigravity() {
+  curl -fsSL https://antigravity.google/cli/install.sh | bash >/dev/null 2>&1
+}
+
+uninstall_gemini_cli() {
+  local removed=0
+  local skipped=0
+  local -a failures=()
+  local -a prefixes=()
+  local -a unique_prefixes=()
+  local -a sudo_prefixes=()
+  local -a sudo_targets=()
+  local -a remaining_bins=()
+  local needs_sudo=0
+  local npm_prefix prefix seen package_dir bin_file check_path entry
+
+  log "$(color "$ANSI_BOLD$ANSI_CYAN" "执行模式：uninstall-gemini" "$ANSI_RESET")"
+  log ""
+  log "开始彻底卸载 Gemini CLI ..."
+
+  prefixes+=("$NPM_GLOBAL_PREFIX")
+  npm_prefix="$(npm config get prefix 2>/dev/null || true)"
+  if [ -n "$npm_prefix" ] && [ "$npm_prefix" != "undefined" ] && [ "$npm_prefix" != "null" ]; then
+    prefixes+=("$npm_prefix")
+  fi
+
+  for prefix in "${prefixes[@]-}"; do
+    [ -n "$prefix" ] || continue
+    seen=0
+    for entry in "${unique_prefixes[@]-}"; do
+      if [ "$entry" = "$prefix" ]; then
+        seen=1
+        break
+      fi
+    done
+    if [ "$seen" -eq 0 ]; then
+      unique_prefixes+=("$prefix")
+    fi
+  done
+
+  for prefix in "${unique_prefixes[@]-}"; do
+    package_dir="$prefix/lib/node_modules/@google/gemini-cli"
+    bin_file="$prefix/bin/gemini"
+    if [ -e "$package_dir" ] || [ -L "$bin_file" ] || [ -e "$bin_file" ]; then
+      if npm uninstall -g @google/gemini-cli --prefix "$prefix" >/dev/null 2>&1; then
+        removed=$((removed + 1))
+      else
+        needs_sudo=1
+        seen=0
+        for entry in "${sudo_prefixes[@]-}"; do
+          if [ "$entry" = "$prefix" ]; then
+            seen=1
+            break
+          fi
+        done
+        if [ "$seen" -eq 0 ]; then
+          sudo_prefixes+=("$prefix")
+        fi
+      fi
+
+      for check_path in "$bin_file" "$package_dir"; do
+        if [ -L "$check_path" ] || [ -e "$check_path" ]; then
+          if rm -rf "$check_path" >/dev/null 2>&1; then
+            removed=$((removed + 1))
+          else
+            needs_sudo=1
+            seen=0
+            for entry in "${sudo_targets[@]-}"; do
+              if [ "$entry" = "$check_path" ]; then
+                seen=1
+                break
+              fi
+            done
+            if [ "$seen" -eq 0 ]; then
+              sudo_targets+=("$check_path")
+            fi
+          fi
+        else
+          skipped=$((skipped + 1))
+        fi
+      done
+    else
+      skipped=$((skipped + 1))
+    fi
+  done
+
+  for check_path in \
+    "$HOME/.local/bin/gemini" \
+    "/opt/homebrew/bin/gemini" \
+    "/usr/local/bin/gemini" \
+    "$HOME/.gemini"; do
+    if [ -L "$check_path" ] || [ -e "$check_path" ]; then
+      if rm -rf "$check_path" >/dev/null 2>&1; then
+        removed=$((removed + 1))
+      else
+        needs_sudo=1
+        seen=0
+        for entry in "${sudo_targets[@]-}"; do
+          if [ "$entry" = "$check_path" ]; then
+            seen=1
+            break
+          fi
+        done
+        if [ "$seen" -eq 0 ]; then
+          sudo_targets+=("$check_path")
+        fi
+      fi
+    else
+      skipped=$((skipped + 1))
+    fi
+  done
+
+  for check_path in \
+    "$HOME/.vscode/extensions/google.geminicodeassist-"* \
+    "$HOME/.vscode/extensions/google.gemini-cli-vscode-ide-companion-"*; do
+    if [ -e "$check_path" ]; then
+      if rm -rf "$check_path" >/dev/null 2>&1; then
+        removed=$((removed + 1))
+      else
+        needs_sudo=1
+        seen=0
+        for entry in "${sudo_targets[@]-}"; do
+          if [ "$entry" = "$check_path" ]; then
+            seen=1
+            break
+          fi
+        done
+        if [ "$seen" -eq 0 ]; then
+          sudo_targets+=("$check_path")
+        fi
+      fi
+    else
+      skipped=$((skipped + 1))
+    fi
+  done
+
+  if [ "$needs_sudo" -eq 1 ]; then
+    log ""
+    log "$(color "$ANSI_YELLOW$ANSI_BOLD" "检测到部分残留需要管理员权限，正在请求密码继续删除..." "$ANSI_RESET")"
+    if command -v sudo >/dev/null 2>&1 && [ -t 0 ]; then
+      if sudo -v; then
+        for prefix in "${sudo_prefixes[@]-}"; do
+          if sudo npm uninstall -g @google/gemini-cli --prefix "$prefix" >/dev/null 2>&1; then
+            removed=$((removed + 1))
+          elif [ -e "$prefix/lib/node_modules/@google/gemini-cli" ] || [ -L "$prefix/bin/gemini" ] || [ -e "$prefix/bin/gemini" ]; then
+            failures+=("sudo npm 卸载失败（prefix=${prefix}）")
+          fi
+        done
+
+        for check_path in "${sudo_targets[@]-}"; do
+          if [ -L "$check_path" ] || [ -e "$check_path" ]; then
+            if sudo rm -rf "$check_path" >/dev/null 2>&1; then
+              removed=$((removed + 1))
+            elif [ -L "$check_path" ] || [ -e "$check_path" ]; then
+              failures+=("sudo 删除失败：${check_path}")
+            fi
+          else
+            skipped=$((skipped + 1))
+          fi
+        done
+      else
+        failures+=("sudo 认证失败，未能继续删除管理员权限残留")
+        for prefix in "${sudo_prefixes[@]-}"; do
+          if [ -e "$prefix/lib/node_modules/@google/gemini-cli" ] || [ -L "$prefix/bin/gemini" ] || [ -e "$prefix/bin/gemini" ]; then
+            failures+=("需要 sudo 处理：prefix=${prefix}")
+          fi
+        done
+        for check_path in "${sudo_targets[@]-}"; do
+          if [ -L "$check_path" ] || [ -e "$check_path" ]; then
+            failures+=("需要 sudo 删除：${check_path}")
+          fi
+        done
+      fi
+    else
+      failures+=("当前会话无法请求 sudo（缺少 sudo 或非交互终端）")
+      for prefix in "${sudo_prefixes[@]-}"; do
+        if [ -e "$prefix/lib/node_modules/@google/gemini-cli" ] || [ -L "$prefix/bin/gemini" ] || [ -e "$prefix/bin/gemini" ]; then
+          failures+=("需要 sudo 处理：prefix=${prefix}")
+        fi
+      done
+      for check_path in "${sudo_targets[@]-}"; do
+        if [ -L "$check_path" ] || [ -e "$check_path" ]; then
+          failures+=("需要 sudo 删除：${check_path}")
+        fi
+      done
+    fi
+  fi
+
+  if command -v which >/dev/null 2>&1; then
+    while IFS= read -r entry; do
+      [ -n "$entry" ] || continue
+      remaining_bins+=("$entry")
+    done < <(which -a gemini 2>/dev/null | awk '!seen[$0]++')
+  fi
+
+  log ""
+  log "卸载摘要："
+  log "  已处理：${removed} 项"
+  log "  已跳过：${skipped} 项（不存在或已清理）"
+  if [ "${#failures[@]}" -gt 0 ]; then
+    log "$(color "$ANSI_YELLOW$ANSI_BOLD" "  失败：${#failures[@]} 项" "$ANSI_RESET")"
+    for entry in "${failures[@]-}"; do
+      log "    - ${entry}"
+    done
+  else
+    log "  失败：0 项"
+  fi
+
+  if [ "${#remaining_bins[@]}" -eq 0 ]; then
+    log "$(color "$ANSI_GREEN$ANSI_BOLD" "Gemini CLI 复检：未发现 gemini 命令残留。" "$ANSI_RESET")"
+  else
+    log "$(color "$ANSI_YELLOW$ANSI_BOLD" "Gemini CLI 复检：仍发现以下路径，请手动处理：" "$ANSI_RESET")"
+    for entry in "${remaining_bins[@]-}"; do
+      log "  - ${entry}"
+    done
+  fi
 }
 
 selftest() {
@@ -623,14 +947,15 @@ ensure_links() {
   write_claude_wrapper
   ensure_link "$LOCAL_BIN_DIR/claude" "$CLAUDE_APP_LINK"
   ensure_link "$LOCAL_BIN_DIR/codex" "$NPM_GLOBAL_PREFIX/bin/codex"
-  ensure_link "$LOCAL_BIN_DIR/gemini" "$NPM_GLOBAL_PREFIX/bin/gemini"
 
   if [ -n "$effective_system_bin" ]; then
     mkdir -p "$effective_system_bin" 2>/dev/null || true
     if [ -w "$effective_system_bin" ]; then
       ensure_link "$effective_system_bin/claude" "$CLAUDE_APP_LINK"
       ensure_link "$effective_system_bin/codex" "$NPM_GLOBAL_PREFIX/bin/codex"
-      ensure_link "$effective_system_bin/gemini" "$NPM_GLOBAL_PREFIX/bin/gemini"
+      if [ -x "$LOCAL_BIN_DIR/agy" ]; then
+        ensure_link "$effective_system_bin/agy" "$LOCAL_BIN_DIR/agy"
+      fi
     fi
   fi
 }
@@ -656,7 +981,7 @@ check_one() {
   local row row_color
   row="$(
     printf '%s %s %s %s %s %s' \
-      "$(pad_display "$display_name" 8)" \
+      "$(pad_display "$display_name" 12)" \
       "$(pad_display "${version:--}" 18)" \
       "$(pad_display "${latest:--}" 18)" \
       "$(pad_display "$(status_display_text "$status")" 12)" \
@@ -683,7 +1008,34 @@ check_one_kimi() {
 
   row="$(
     printf '%s %s %s %s %s %s' \
-      "$(pad_display "Kimi" 8)" \
+      "$(pad_display "Kimi" 12)" \
+      "$(pad_display "${version:--}" 18)" \
+      "$(pad_display "${latest:--}" 18)" \
+      "$(pad_display "$(status_display_text "$status")" 12)" \
+      "$(pad_display "$tip" 18)" \
+      "${path:--}"
+  )"
+  row_color="$(line_color_for_status "$status")"
+  log "$(color "$row_color" "$row" "$ANSI_RESET")"
+}
+
+check_one_antigravity() {
+  local probe state path version latest result status tip row row_color
+
+  probe="$(probe_antigravity)"
+  state="${probe%%|*}"
+  path="${probe#*|}"
+  path="${path%%|*}"
+  version="${probe##*|}"
+  latest="$(latest_antigravity_version)"
+
+  result="$(status_and_tip_antigravity "$state" "$version" "$latest")"
+  status="${result%%|*}"
+  tip="${result#*|}"
+
+  row="$(
+    printf '%s %s %s %s %s %s' \
+      "$(pad_display "Antigravity" 12)" \
       "$(pad_display "${version:--}" 18)" \
       "$(pad_display "${latest:--}" 18)" \
       "$(pad_display "$(status_display_text "$status")" 12)" \
@@ -734,10 +1086,28 @@ raw_status_kimi() {
     "kimi" "Kimi" "${version:--}" "${latest:--}" "$status" "$tip" "${path:--}"
 }
 
+raw_status_antigravity() {
+  local probe state path version latest result status tip
+
+  probe="$(probe_antigravity)"
+  state="${probe%%|*}"
+  path="${probe#*|}"
+  path="${path%%|*}"
+  version="${probe##*|}"
+  latest="$(latest_antigravity_version)"
+
+  result="$(status_and_tip_antigravity "$state" "$version" "$latest")"
+  status="${result%%|*}"
+  tip="${result#*|}"
+
+  printf '%s|%s|%s|%s|%s|%s|%s\n' \
+    "antigravity" "Antigravity" "${version:--}" "${latest:--}" "$status" "$tip" "${path:--}"
+}
+
 check_raw() {
   raw_status_one "claude" "Claude" "claude" "@anthropic-ai/claude-code"
   raw_status_one "codex" "Codex" "codex" "@openai/codex"
-  raw_status_one "gemini" "Gemini" "gemini" "@google/gemini-cli"
+  raw_status_antigravity
   raw_status_kimi
 }
 
@@ -776,6 +1146,23 @@ snapshot_one_kimi() {
   tip="${result#*|}"
 
   render_snapshot_card "Kimi" "${version:--}" "${latest:--}" "$status" "$tip"
+}
+
+snapshot_one_antigravity() {
+  local probe state path version latest status tip result
+
+  probe="$(probe_antigravity)"
+  state="${probe%%|*}"
+  path="${probe#*|}"
+  path="${path%%|*}"
+  version="${probe##*|}"
+  latest="$(latest_antigravity_version)"
+
+  result="$(status_and_tip_antigravity "$state" "$version" "$latest")"
+  status="${result%%|*}"
+  tip="${result#*|}"
+
+  render_snapshot_card "Antigravity" "${version:--}" "${latest:--}" "$status" "$tip"
 }
 
 render_snapshot_card() {
@@ -832,9 +1219,6 @@ repair_or_update_one() {
       Codex)
         install_global_pkg "$pkg" "$target_version"
         ;;
-      Gemini)
-        install_global_pkg "$pkg" "$target_version"
-        ;;
       *)
         die "未知工具：$display_name"
         ;;
@@ -854,11 +1238,63 @@ repair_or_update_kimi() {
   fi
 }
 
+repair_or_update_antigravity() {
+  local mode="${1:-fix}"
+  local probe state path version latest result status
+
+  probe="$(probe_antigravity)"
+  state="${probe%%|*}"
+  path="${probe#*|}"
+  path="${path%%|*}"
+  version="${probe##*|}"
+  latest="$(latest_antigravity_version)"
+  result="$(status_and_tip_antigravity "$state" "$version" "$latest")"
+  status="${result%%|*}"
+
+  case "$mode" in
+    fix)
+      case "$status" in
+        未安装|不可执行|异常比较结果|未知)
+          install_antigravity
+          ;;
+        *)
+          ;;
+      esac
+      ;;
+    update)
+      case "$status" in
+        可更新)
+          if [ -n "$path" ] && [ -x "$path" ]; then
+            if ! "$path" update >/dev/null 2>&1; then
+              install_antigravity
+            fi
+          else
+            install_antigravity
+          fi
+          ;;
+        未安装|不可执行|异常比较结果|未知)
+          install_antigravity
+          ;;
+        已安装)
+          if [ -n "$path" ] && [ -x "$path" ]; then
+            "$path" update >/dev/null 2>&1 || true
+          fi
+          ;;
+        *)
+          ;;
+      esac
+      ;;
+    *)
+      die "未知模式：$mode"
+      ;;
+  esac
+}
+
 print_check_table() {
   log "执行检查结果："
   log "$(color "$ANSI_BOLD$ANSI_CYAN" "$(
     printf '%s %s %s %s %s %s' \
-      "$(pad_display '工具' 8)" \
+      "$(pad_display '工具' 12)" \
       "$(pad_display '当前版本' 18)" \
       "$(pad_display '最新版本' 18)" \
       "$(pad_display '状态' 12)" \
@@ -867,7 +1303,7 @@ print_check_table() {
   )" "$ANSI_RESET")"
   log "$(color "$ANSI_DIM$ANSI_GRAY" "$(
     printf '%s %s %s %s %s %s' \
-      "$(pad_display '------' 8)" \
+      "$(pad_display '------' 12)" \
       "$(pad_display '------' 18)" \
       "$(pad_display '------' 18)" \
       "$(pad_display '------' 12)" \
@@ -876,7 +1312,7 @@ print_check_table() {
   )" "$ANSI_RESET")"
   check_one "Claude" "claude" "@anthropic-ai/claude-code" "$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code"
   check_one "Codex" "codex" "@openai/codex" "$NPM_GLOBAL_PREFIX/lib/node_modules/@openai/codex"
-  check_one "Gemini" "gemini" "@google/gemini-cli" "$NPM_GLOBAL_PREFIX/lib/node_modules/@google/gemini-cli"
+  check_one_antigravity
   check_one_kimi
 }
 
@@ -889,14 +1325,14 @@ update_one_tool() {
     codex)
       repair_or_update_one "Codex" "codex" "@openai/codex" "$NPM_GLOBAL_PREFIX/lib/node_modules/@openai/codex" "update"
       ;;
-    gemini)
-      repair_or_update_one "Gemini" "gemini" "@google/gemini-cli" "$NPM_GLOBAL_PREFIX/lib/node_modules/@google/gemini-cli" "update"
+    antigravity)
+      repair_or_update_antigravity "update"
       ;;
     kimi)
       repair_or_update_kimi "update"
       ;;
     *)
-      die "update-one 仅支持：claude|codex|gemini|kimi"
+      die "update-one 仅支持：claude|codex|antigravity|kimi"
       ;;
   esac
 }
@@ -905,7 +1341,7 @@ tool_display_name() {
   case "$1" in
     claude) printf 'Claude' ;;
     codex) printf 'Codex' ;;
-    gemini) printf 'Gemini' ;;
+    antigravity) printf 'Antigravity' ;;
     kimi) printf 'Kimi' ;;
     *) printf '%s' "$1" ;;
   esac
@@ -1172,7 +1608,7 @@ main() {
   done
 
   case "$mode" in
-    snapshot|check|fix|update|all|selftest|check-raw|update-one) ;;
+    snapshot|check|fix|update|all|selftest|check-raw|update-one|uninstall-gemini) ;;
     -h|--help|help)
       usage
       exit 0
@@ -1185,15 +1621,17 @@ main() {
 
   if [ "$mode" = "update-one" ]; then
     if [ "${#extra_args[@]}" -lt 1 ]; then
-      die "用法：scripts/ai-toolchain-manager.sh update-one [claude|codex|gemini|kimi]"
+      die "用法：scripts/ai-toolchain-manager.sh update-one [claude|codex|antigravity|kimi]"
     fi
     if [ "${#extra_args[@]}" -gt 1 ]; then
       die "update-one 参数过多：${extra_args[*]}"
     fi
     target_tool="$(printf '%s' "${extra_args[0]}" | tr '[:upper:]' '[:lower:]')"
     case "$target_tool" in
-      claude|codex|gemini|kimi) ;;
-      *) die "update-one 仅支持：claude|codex|gemini|kimi" ;;
+      claude|codex|antigravity|kimi) ;;
+      *)
+        die "update-one 仅支持：claude|codex|antigravity|kimi"
+        ;;
     esac
   else
     if [ "${#extra_args[@]}" -gt 0 ]; then
@@ -1217,6 +1655,11 @@ main() {
   if [ "$mode" = "selftest" ]; then
     selftest
     return $?
+  fi
+
+  if [ "$mode" = "uninstall-gemini" ]; then
+    uninstall_gemini_cli
+    return 0
   fi
 
   if [ "$mode" = "all" ]; then
@@ -1274,7 +1717,7 @@ main() {
     log "$(color "$ANSI_DIM$ANSI_GRAY" "────────────────────────────────" "$ANSI_RESET")"
     snapshot_one "Claude" "claude" "@anthropic-ai/claude-code"
     snapshot_one "Codex" "codex" "@openai/codex"
-    snapshot_one "Gemini" "gemini" "@google/gemini-cli"
+    snapshot_one_antigravity
     snapshot_one_kimi
     return 0
   fi
@@ -1292,7 +1735,7 @@ main() {
 
   repair_or_update_one "Claude" "claude" "@anthropic-ai/claude-code" "$CLAUDE_PREFIX/node_modules/@anthropic-ai/claude-code" "$mode"
   repair_or_update_one "Codex" "codex" "@openai/codex" "$NPM_GLOBAL_PREFIX/lib/node_modules/@openai/codex" "$mode"
-  repair_or_update_one "Gemini" "gemini" "@google/gemini-cli" "$NPM_GLOBAL_PREFIX/lib/node_modules/@google/gemini-cli" "$mode"
+  repair_or_update_antigravity "$mode"
   repair_or_update_kimi "$mode"
   ensure_links
 
