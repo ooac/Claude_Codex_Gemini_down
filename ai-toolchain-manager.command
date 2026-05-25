@@ -12,6 +12,7 @@ normalize_mode() {
     "检查"|"check"|"c") printf 'check' ;;
     "修复"|"fix"|"f") printf 'fix' ;;
     "卸载Gemini"|"uninstall-gemini"|"g") printf 'uninstall-gemini' ;;
+    "修复KimiVS插件"|"fix-kimi-vscode"|"k") printf 'fix-kimi-vscode' ;;
     "更新"|"update"|"u") printf 'update' ;;
     "快照"|"snapshot"|"s") printf 'snapshot' ;;
     "自测"|"selftest"|"t") printf 'selftest' ;;
@@ -46,7 +47,7 @@ render_update_hint() {
   RAW_STATUS="$("$SCRIPT_PATH" check-raw 2>/dev/null || true)"
   while IFS='|' read -r key name current latest status tip path; do
     [ -n "$key" ] || continue
-    if [ "$status" = "可更新" ]; then
+    if [ "$status" = "可更新" ] || [ "$status" = "迁移未完成" ]; then
       case "$key" in
         claude) item="1 ${name} ${current} -> ${latest}" ;;
         codex) item="2 ${name} ${current} -> ${latest}" ;;
@@ -83,8 +84,12 @@ should_run_single_update() {
 
   status="$(status_from_current_raw "$key")"
   case "$status" in
-    可更新|未安装|不可执行|异常比较结果)
+    可更新|迁移未完成|未安装|不可执行|异常比较结果)
       return 0
+      ;;
+    PATH未配置)
+      printf '%s 需要先修复 PATH，请按 [f] 修复异常。\n' "$name"
+      return 1
       ;;
     "")
       printf '%s 当前状态未知，已跳过更新。\n' "$name"
@@ -111,7 +116,7 @@ run_interactive_menu() {
     printf '  [2] 仅升级 Codex\n'
     printf '  [3] 仅升级 Antigravity\n'
     printf '  [4] 仅升级 Kimi\n'
-    printf '  [c] 仅检查   [f] 修复异常   [g] 卸载 Gemini   [q] 退出\n'
+    printf '  [c] 仅检查   [f] 修复异常   [g] 卸载 Gemini   [k] 修复 Kimi VS插件   [q] 退出\n'
     printf '请输入：'
     if ! read -r input; then
       input="q"
@@ -163,12 +168,16 @@ run_interactive_menu() {
         run_mode uninstall-gemini || true
         printf '\n'
         ;;
+      "k"|"K")
+        run_mode fix-kimi-vscode || true
+        printf '\n'
+        ;;
       "q"|"Q"|"quit"|"取消")
         printf '已取消。\n'
         break
         ;;
       *)
-        printf '无效输入，请输入回车/1/2/3/4/c/f/g/q。\n\n'
+        printf '无效输入，请输入回车/1/2/3/4/c/f/g/k/q。\n\n'
         ;;
     esac
   done

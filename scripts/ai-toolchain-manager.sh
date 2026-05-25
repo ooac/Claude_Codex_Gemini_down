@@ -45,7 +45,7 @@ line_color_for_status() {
     已是最新|已安装|无需处理)
       printf '%s' "$ANSI_GREEN"
       ;;
-    本地更新|可更新|无法检查|异常比较结果)
+    本地更新|可更新|迁移未完成|PATH未配置|无法检查|异常比较结果)
       printf '%s' "$ANSI_YELLOW"
       ;;
     不可执行|未安装)
@@ -62,10 +62,10 @@ status_display_text() {
     已是最新|已安装|无需处理)
       printf '✓ %s' "$1"
       ;;
-    本地更新|可更新)
+    本地更新|可更新|迁移未完成)
       printf '↻ %s' "$1"
       ;;
-    不可执行|未安装)
+    PATH未配置|不可执行|未安装)
       printf '⚠ %s' "$1"
       ;;
     *)
@@ -145,11 +145,12 @@ card_row() {
 usage() {
   cat <<'EOF'
 用法：
-  scripts/ai-toolchain-manager.sh [snapshot|check|fix|update|all|selftest|check-raw|update-one|uninstall-gemini]
+  scripts/ai-toolchain-manager.sh [snapshot|check|fix|update|all|selftest|check-raw|update-one|uninstall-gemini|fix-kimi-vscode]
   scripts/ai-toolchain-manager.sh update-one [claude|codex|antigravity|kimi]
   scripts/ai-toolchain-manager.sh all --compact
   scripts/ai-toolchain-manager.sh update-one codex --compact
   scripts/ai-toolchain-manager.sh uninstall-gemini
+  scripts/ai-toolchain-manager.sh fix-kimi-vscode
 
 说明：
   snapshot 输出当前四项工具的摘要和建议，适合启动前预览
@@ -159,6 +160,7 @@ usage() {
   update  升级到最新版本，并修复入口
   update-one 仅更新单个工具
   uninstall-gemini 彻底卸载 Gemini CLI（含用户数据目录）
+  fix-kimi-vscode 将 VS Code Kimi 插件指向新版 Kimi Code CLI
   all     一键执行：check -> fix -> update -> check
   selftest  仅执行逻辑回归测试，不安装不更新
   --compact 仅输出简略进度（建议用于 all / update-one）
@@ -350,13 +352,11 @@ probe_tool() {
 }
 
 probe_kimi() {
-  local cmd output version path
-  for cmd in kimi kimi-cli; do
-    path="$(command -v "$cmd" 2>/dev/null || true)"
-    if [ -z "$path" ]; then
-      continue
-    fi
-    if ! output="$("$cmd" --version 2>&1)"; then
+  local output version path
+
+  path="$(resolve_kimi_cmd)"
+  if [ -n "$path" ] && [ -x "$path" ]; then
+    if ! output="$("$path" --version 2>&1)"; then
       printf 'broken|%s|\n' "$path"
       return 0
     fi
@@ -366,7 +366,22 @@ probe_kimi() {
     fi
     printf 'ok|%s|%s\n' "$path" "$version"
     return 0
-  done
+  fi
+
+  path="$(command -v kimi-cli 2>/dev/null || true)"
+  if [ -n "$path" ]; then
+    if ! output="$("$path" --version 2>&1)"; then
+      printf 'broken|%s|\n' "$path"
+      return 0
+    fi
+    version="$(extract_version "$output")"
+    if [ -z "$version" ]; then
+      version="-"
+    fi
+    printf 'ok|%s|%s\n' "$path" "$version"
+    return 0
+  fi
+
   printf 'missing||\n'
 }
 
@@ -393,35 +408,16 @@ probe_antigravity() {
 }
 
 latest_kimi_version() {
-  local version=""
-
-  if command -v python3 >/dev/null 2>&1; then
+  local version
+  version="$(
+    curl -fsSL --connect-timeout 5 --max-time 12 --retry 2 --retry-delay 1 \
+      "https://code.kimi.com/kimi-code/latest" 2>/dev/null | tr -d '[:space:]' || true
+  )"
+  if [ -z "$version" ] && command -v wget >/dev/null 2>&1; then
     version="$(
-      python3 - <<'PY' 2>/dev/null
-import json
-import urllib.request
-
-try:
-    with urllib.request.urlopen("https://pypi.org/pypi/kimi-cli/json", timeout=8) as resp:
-        data = json.load(resp)
-    print((data.get("info") or {}).get("version", ""))
-except Exception:
-    pass
-PY
+      wget -q -T 12 -O - "https://code.kimi.com/kimi-code/latest" 2>/dev/null | tr -d '[:space:]' || true
     )"
   fi
-
-  if [ -z "$version" ]; then
-    if ! version="$(
-      curl --retry 2 --retry-delay 2 --connect-timeout 10 --max-time 20 -fsSL https://pypi.org/pypi/kimi-cli/json 2>/dev/null \
-        | tr -d '\n' \
-        | sed -n 's/.*"version":"\([0-9][0-9.]*\)".*/\1/p' \
-        | head -n 1
-    )"; then
-      version=""
-    fi
-  fi
-
   printf '%s' "$version"
 }
 
@@ -460,11 +456,34 @@ status_and_tip_kimi() {
   local state="$1"
   local current="${2:-}"
   local latest="${3:-}"
-  local cmp
+  local path="${4:-}"
+  local cmp migration_health migration_state old_sessions new_sessions old_history new_history reason path_state
   case "$state" in
     ok)
+      if [ -n "$path" ] && ! has_kimi_migrate_command "$path"; then
+        printf '可更新|检测到旧架构，建议执行 update 迁移到 kimi-code\n'
+        return 0
+      fi
+
+      migration_health="$(kimi_migration_health)"
+      IFS='|' read -r migration_state old_sessions new_sessions old_history new_history reason <<<"$migration_health"
+      if [ "$migration_state" = "incomplete" ]; then
+        printf '迁移未完成|执行 update 并完成会话迁移\n'
+        return 0
+      fi
+
+      path_state="$(kimi_command_path_state)"
+      case "$path_state" in
+        missing|stale)
+          printf 'PATH未配置|执行 fix 后可直接输入 kimi\n'
+          return 0
+          ;;
+        *)
+          ;;
+      esac
+
       if [ -z "$latest" ] || [ "$latest" = "-" ]; then
-        printf '无法检查|请检查网络或 PyPI\n'
+        printf '无法检查|请检查网络或 kimi-code 版本源\n'
       elif [ -n "$current" ] && [ "$current" != "-" ]; then
         cmp="$(semver_cmp "$current" "$latest")"
         case "$cmp" in
@@ -521,15 +540,309 @@ status_and_tip_antigravity() {
 }
 
 install_kimi() {
-  local mode="${1:-fix}"
+  curl --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 -fsSL https://code.kimi.com/kimi-code/install.sh | bash >/dev/null 2>&1
+}
 
-  if [ "$mode" = "update" ] && command -v uv >/dev/null 2>&1; then
-    if uv tool upgrade kimi-cli >/dev/null 2>&1; then
+count_kimi_session_states() {
+  local home_dir="$1"
+  if [ ! -d "$home_dir/sessions" ]; then
+    printf '0'
+    return 0
+  fi
+  find "$home_dir/sessions" -type f -name 'state.json' 2>/dev/null | wc -l | tr -d '[:space:]'
+}
+
+count_kimi_history_files() {
+  local home_dir="$1"
+  if [ ! -d "$home_dir/user-history" ]; then
+    printf '0'
+    return 0
+  fi
+  find "$home_dir/user-history" -type f 2>/dev/null | wc -l | tr -d '[:space:]'
+}
+
+read_kimi_migration_report() {
+  local report_path="$1"
+  local marker_path="${HOME}/.kimi/.migrated-to-kimi-code"
+  python3 - "$report_path" "$marker_path" <<'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+marker_path = sys.argv[2]
+
+
+def load_json(json_path):
+    if not os.path.isfile(json_path):
+        return None
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+report = load_json(path)
+marker = load_json(marker_path)
+runs = []
+if marker:
+    runs.extend(marker.get("runs") or [])
+if report:
+    runs.append(report)
+
+if not runs:
+    print("0|false||0|0|0|0")
+    raise SystemExit(0)
+
+# 后续的 config-only 迁移会覆盖 migration-report.json；会话是否完整迁移
+# 需要以历史 run 中最近一次 scope=all 的官方结果为准。
+full_runs = [
+    run for run in runs
+    if (((run.get("summary") or {}).get("sessions") or {}).get("scope") or "") != "config-only"
+]
+data = full_runs[-1] if full_runs else runs[-1]
+
+summary = data.get("summary") or {}
+config = summary.get("config") or {}
+sessions = summary.get("sessions") or {}
+history = summary.get("userHistory") or {}
+
+config_migrated = "true" if config.get("migrated") is True else "false"
+scope = sessions.get("scope") or ""
+sessions_expected = (sessions.get("sessionsMigrated") or 0) + (sessions.get("sessionsAlreadyMigrated") or 0)
+sessions_failed = len(sessions.get("sessionsFailed") or [])
+history_copied = history.get("copied") or 0
+history_skipped = history.get("skippedExisting") or 0
+
+print(f"1|{config_migrated}|{scope}|{sessions_expected}|{sessions_failed}|{history_copied}|{history_skipped}")
+PY
+}
+
+kimi_migration_health() {
+  local legacy_home="$HOME/.kimi"
+  local new_home="${KIMI_CODE_HOME:-$HOME/.kimi-code}"
+  local report_path="${new_home}/migration-report.json"
+  local old_sessions old_history new_sessions new_history
+  local report_exists config_migrated scope sessions_expected sessions_failed history_copied history_skipped
+
+  if [ ! -d "$legacy_home" ]; then
+    printf 'complete|0|0|0|0|no_legacy_data\n'
+    return 0
+  fi
+
+  old_sessions="$(count_kimi_session_states "$legacy_home")"
+  old_history="$(count_kimi_history_files "$legacy_home")"
+  new_sessions="$(count_kimi_session_states "$new_home")"
+  new_history="$(count_kimi_history_files "$new_home")"
+
+  IFS='|' read -r report_exists config_migrated scope sessions_expected sessions_failed history_copied history_skipped \
+    <<<"$(read_kimi_migration_report "$report_path")"
+
+  if [ "$report_exists" != "1" ]; then
+    printf 'incomplete|%s|%s|%s|%s|missing_report\n' "$old_sessions" "$new_sessions" "$old_history" "$new_history"
+    return 0
+  fi
+
+  if [ "$config_migrated" != "true" ]; then
+    printf 'incomplete|%s|%s|%s|%s|config_not_migrated\n' "$old_sessions" "$new_sessions" "$old_history" "$new_history"
+    return 0
+  fi
+
+  if [ "$old_history" -gt 0 ] && [ "$new_history" -lt "$old_history" ]; then
+    printf 'incomplete|%s|%s|%s|%s|history_not_fully_migrated\n' "$old_sessions" "$new_sessions" "$old_history" "$new_history"
+    return 0
+  fi
+
+  if [ "$old_sessions" -gt 0 ]; then
+    if [ "$scope" = "config-only" ]; then
+      printf 'incomplete|%s|%s|%s|%s|sessions_scope_config_only\n' "$old_sessions" "$new_sessions" "$old_history" "$new_history"
+      return 0
+    fi
+    if [ "${sessions_failed:-0}" -gt 0 ]; then
+      printf 'incomplete|%s|%s|%s|%s|sessions_failed\n' "$old_sessions" "$new_sessions" "$old_history" "$new_history"
+      return 0
+    fi
+    if [ "$new_sessions" -lt "${sessions_expected:-0}" ]; then
+      printf 'incomplete|%s|%s|%s|%s|session_count_not_fully_migrated\n' "$old_sessions" "$new_sessions" "$old_history" "$new_history"
       return 0
     fi
   fi
 
-  curl --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 -fsSL https://code.kimi.com/install.sh | bash >/dev/null 2>&1
+  printf 'complete|%s|%s|%s|%s|ok\n' "$old_sessions" "$new_sessions" "$old_history" "$new_history"
+}
+
+resolve_kimi_cmd() {
+  local path
+  path="${KIMI_CODE_HOME:-$HOME/.kimi-code}/bin/kimi"
+  if [ -x "$path" ]; then
+    printf '%s' "$path"
+    return 0
+  fi
+  path="$(command -v kimi 2>/dev/null || true)"
+  if [ -z "$path" ] && [ -x "$HOME/.local/bin/kimi" ]; then
+    path="$HOME/.local/bin/kimi"
+  fi
+  printf '%s' "$path"
+}
+
+kimi_code_bin_dir() {
+  printf '%s' "${KIMI_CODE_HOME:-$HOME/.kimi-code}/bin"
+}
+
+kimi_path_configured() {
+  local file
+  for file in \
+    "$HOME/.config/fish/config.fish" \
+    "$HOME/.zshrc" \
+    "$HOME/.zprofile" \
+    "$HOME/.bashrc" \
+    "$HOME/.bash_profile"; do
+    if [ -f "$file" ] && grep -Fq '.kimi-code/bin' "$file" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+kimi_command_path_state() {
+  local bin_dir direct_cmd path_cmd
+  bin_dir="$(kimi_code_bin_dir)"
+  direct_cmd="${bin_dir}/kimi"
+
+  if [ ! -x "$direct_cmd" ]; then
+    printf 'not_needed'
+    return 0
+  fi
+
+  path_cmd="$(command -v kimi 2>/dev/null || true)"
+  if [ -z "$path_cmd" ]; then
+    if kimi_path_configured; then
+      printf 'ok'
+      return 0
+    fi
+    printf 'missing'
+    return 0
+  fi
+
+  if [ "$path_cmd" = "$direct_cmd" ]; then
+    printf 'ok'
+    return 0
+  fi
+
+  if [ "$(cd "$(dirname "$path_cmd")" 2>/dev/null && pwd -P)/$(basename "$path_cmd")" = "$(cd "$(dirname "$direct_cmd")" 2>/dev/null && pwd -P)/$(basename "$direct_cmd")" ]; then
+    printf 'ok'
+    return 0
+  fi
+
+  if "$path_cmd" --version >/dev/null 2>&1; then
+    if kimi_path_configured; then
+      printf 'ok'
+      return 0
+    fi
+    printf 'ok'
+  else
+    printf 'stale'
+  fi
+}
+
+append_once() {
+  local file="$1"
+  local marker="$2"
+  local content="$3"
+
+  mkdir -p "$(dirname "$file")"
+  touch "$file"
+  if grep -Fq "$marker" "$file" 2>/dev/null; then
+    return 0
+  fi
+
+  {
+    printf '\n'
+    printf '%s\n' "$marker"
+    printf '%s\n' "$content"
+  } >>"$file"
+}
+
+ensure_kimi_path_config() {
+  local bin_dir fish_file zshrc zprofile bashrc bash_profile
+  bin_dir="$(kimi_code_bin_dir)"
+
+  if [ ! -x "${bin_dir}/kimi" ]; then
+    return 0
+  fi
+
+  case ":$PATH:" in
+    *":${bin_dir}:"*) ;;
+    *) export PATH="${bin_dir}:$PATH" ;;
+  esac
+
+  fish_file="$HOME/.config/fish/config.fish"
+  zshrc="$HOME/.zshrc"
+  zprofile="$HOME/.zprofile"
+  bashrc="$HOME/.bashrc"
+  bash_profile="$HOME/.bash_profile"
+
+  append_once "$fish_file" "# Kimi Code CLI PATH" "fish_add_path -g \"\$HOME/.kimi-code/bin\""
+  append_once "$zshrc" "# Kimi Code CLI PATH" "export PATH=\"\$HOME/.kimi-code/bin:\$PATH\""
+  append_once "$zprofile" "# Kimi Code CLI PATH" "export PATH=\"\$HOME/.kimi-code/bin:\$PATH\""
+  append_once "$bashrc" "# Kimi Code CLI PATH" "export PATH=\"\$HOME/.kimi-code/bin:\$PATH\""
+  append_once "$bash_profile" "# Kimi Code CLI PATH" "export PATH=\"\$HOME/.kimi-code/bin:\$PATH\""
+}
+
+has_kimi_migrate_command() {
+  local kimi_cmd="$1"
+  [ -n "$kimi_cmd" ] || return 1
+  "$kimi_cmd" migrate --help >/dev/null 2>&1
+}
+
+run_kimi_migration_if_needed() {
+  local kimi_cmd old_home new_home attempt
+  local migration_health migration_state old_sessions new_sessions old_history new_history reason
+  old_home="$HOME/.kimi"
+  new_home="${KIMI_CODE_HOME:-$HOME/.kimi-code}"
+  kimi_cmd="$(resolve_kimi_cmd)"
+
+  if [ ! -d "$old_home" ]; then
+    return 0
+  fi
+  if [ -z "$kimi_cmd" ] || [ ! -x "$kimi_cmd" ]; then
+    printf '未找到 kimi 命令，无法执行迁移。请确认安装成功后手动运行：kimi migrate\n' >&2
+    return 1
+  fi
+  if ! has_kimi_migrate_command "$kimi_cmd"; then
+    printf '当前 kimi 不支持 migrate（可能仍是旧架构）。请重试 update，或手动执行：%s migrate\n' "$kimi_cmd" >&2
+    return 1
+  fi
+
+  log "检测到旧版数据目录：${old_home}"
+  for attempt in 1 2; do
+    log "执行 Kimi 迁移（第 ${attempt}/2 次）：${kimi_cmd} migrate"
+    if ! "$kimi_cmd" migrate; then
+      if [ "$attempt" -eq 1 ]; then
+        log "$(color "$ANSI_YELLOW$ANSI_BOLD" "迁移执行未完成，将自动重试一次。" "$ANSI_RESET")"
+        continue
+      fi
+      printf 'Kimi 迁移执行失败（已重试）。请重新运行：%s update-one kimi\n' "$0" >&2
+      return 1
+    fi
+
+    migration_health="$(kimi_migration_health)"
+    IFS='|' read -r migration_state old_sessions new_sessions old_history new_history reason <<<"$migration_health"
+    if [ "$migration_state" = "complete" ]; then
+      log "Kimi 迁移校验通过（旧会话 ${old_sessions} -> 新会话 ${new_sessions}，旧历史 ${old_history} -> 新历史 ${new_history}）。"
+      log "Kimi 迁移完成（目标目录：${new_home}）。"
+      return 0
+    fi
+
+    log "$(color "$ANSI_YELLOW$ANSI_BOLD" "迁移校验未通过（原因：${reason}，旧会话 ${old_sessions} -> 新会话 ${new_sessions}）。" "$ANSI_RESET")"
+    if [ "$attempt" -eq 1 ]; then
+      log "$(color "$ANSI_YELLOW$ANSI_BOLD" "将自动再执行一次迁移，请在交互中选择包含会话的迁移选项。" "$ANSI_RESET")"
+    fi
+  done
+
+  printf 'Kimi 迁移仍未完成（严格校验失败）。请执行：%s update-one kimi，并在 migrate 中选择会话迁移。\n' "$0" >&2
+  return 1
 }
 
 install_antigravity() {
@@ -750,9 +1063,84 @@ uninstall_gemini_cli() {
   fi
 }
 
+fix_kimi_vscode() {
+  local kimi_cmd settings_path output exit_code
+  kimi_cmd="${KIMI_CODE_HOME:-$HOME/.kimi-code}/bin/kimi"
+  if [ ! -x "$kimi_cmd" ]; then
+    kimi_cmd="$(resolve_kimi_cmd)"
+  fi
+
+  log "$(color "$ANSI_BOLD$ANSI_CYAN" "执行模式：fix-kimi-vscode" "$ANSI_RESET")"
+  log ""
+
+  if [ -z "$kimi_cmd" ] || [ ! -x "$kimi_cmd" ]; then
+    printf '未找到新版 Kimi Code CLI。请先执行 update-one kimi 或重新安装 Kimi Code。\n' >&2
+    return 1
+  fi
+
+  if ! "$kimi_cmd" --version >/dev/null 2>&1; then
+    printf '新版 Kimi Code CLI 不可执行：%s\n' "$kimi_cmd" >&2
+    return 1
+  fi
+
+  settings_path="$HOME/Library/Application Support/Code/User/settings.json"
+  python3 - "$settings_path" "$kimi_cmd" <<'PY'
+import json
+import pathlib
+import sys
+
+settings_path = pathlib.Path(sys.argv[1])
+kimi_cmd = sys.argv[2]
+settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+if settings_path.exists() and settings_path.read_text(encoding="utf-8").strip():
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"VS Code settings.json 不是标准 JSON，无法安全写入：{exc}")
+else:
+    data = {}
+
+if not isinstance(data, dict):
+    raise SystemExit("VS Code settings.json 根节点不是对象，无法安全写入。")
+
+data["kimi.executablePath"] = kimi_cmd
+settings_path.write_text(
+    json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+
+  log "已写入 VS Code 设置：kimi.executablePath = ${kimi_cmd}"
+
+  set +e
+  output="$("$kimi_cmd" info --json 2>&1)"
+  exit_code=$?
+  set -e
+
+  if [ "$exit_code" -eq 0 ]; then
+    log "$(color "$ANSI_GREEN$ANSI_BOLD" "Kimi VS 插件兼容性校验通过。" "$ANSI_RESET")"
+    return 0
+  fi
+
+  log "$(color "$ANSI_RED$ANSI_BOLD" "Kimi VS 插件兼容性校验失败。" "$ANSI_RESET")"
+  log "已按要求指向新版 Kimi Code CLI，但当前 VS Code 插件仍在调用旧协议：info --json。"
+  if printf '%s\n' "$output" | grep -Fq "unknown option '--json'"; then
+    log "结论：当前 Kimi VS Code 插件版本不兼容新版 Kimi Code CLI，需要等待或升级插件适配。"
+  else
+    log "CLI 输出："
+    printf '%s\n' "$output"
+  fi
+  return 1
+}
+
 selftest() {
   local failed=0
   local out
+  local tmp_home
+
+  tmp_home="$(mktemp -d)"
+  mkdir -p "$tmp_home/.kimi-code"
 
   out="$(semver_cmp "0.124.0" "0.125.0")"
   if [ "$out" = "-1" ]; then
@@ -786,7 +1174,7 @@ selftest() {
     failed=1
   fi
 
-  out="$(status_and_tip_kimi "ok" "1.37.0" "1.38.0")"
+  out="$(HOME="$tmp_home" KIMI_CODE_HOME="$tmp_home/.kimi-code" status_and_tip_kimi "ok" "1.37.0" "1.38.0")"
   if [ "${out%%|*}" = "可更新" ]; then
     log "PASS status_and_tip_kimi 可更新"
   else
@@ -794,7 +1182,7 @@ selftest() {
     failed=1
   fi
 
-  out="$(status_and_tip_kimi "ok" "1.38.0" "1.38.0")"
+  out="$(HOME="$tmp_home" KIMI_CODE_HOME="$tmp_home/.kimi-code" status_and_tip_kimi "ok" "1.38.0" "1.38.0")"
   if [ "${out%%|*}" = "已是最新" ]; then
     log "PASS status_and_tip_kimi 已是最新"
   else
@@ -802,11 +1190,40 @@ selftest() {
     failed=1
   fi
 
-  out="$(status_and_tip_kimi "ok" "1.38.0" "")"
+  out="$(HOME="$tmp_home" KIMI_CODE_HOME="$tmp_home/.kimi-code" status_and_tip_kimi "ok" "1.38.0" "")"
   if [ "${out%%|*}" = "无法检查" ]; then
     log "PASS status_and_tip_kimi 无法检查"
   else
     log "FAIL status_and_tip_kimi 无法检查 (got: $out)"
+    failed=1
+  fi
+
+  mkdir -p "$tmp_home/.kimi-code/bin"
+  cat >"$tmp_home/.kimi-code/bin/kimi" <<'EOF'
+#!/bin/sh
+case "$1" in
+  --version) printf '0.1.1\n' ;;
+  migrate) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod 755 "$tmp_home/.kimi-code/bin/kimi"
+
+  out="$(HOME="$tmp_home" KIMI_CODE_HOME="$tmp_home/.kimi-code" PATH="/usr/bin:/bin" status_and_tip_kimi "ok" "1.38.0" "1.38.0" "$tmp_home/.kimi-code/bin/kimi")"
+  if [ "${out%%|*}" = "PATH未配置" ]; then
+    log "PASS status_and_tip_kimi PATH未配置"
+  else
+    log "FAIL status_and_tip_kimi PATH未配置 (got: $out)"
+    failed=1
+  fi
+
+  HOME="$tmp_home" KIMI_CODE_HOME="$tmp_home/.kimi-code" PATH="/usr/bin:/bin" ensure_kimi_path_config
+  if grep -Fq '# Kimi Code CLI PATH' "$tmp_home/.config/fish/config.fish" \
+    && grep -Fq '$HOME/.kimi-code/bin' "$tmp_home/.zshrc" \
+    && grep -Fq '$HOME/.kimi-code/bin' "$tmp_home/.bashrc"; then
+    log "PASS ensure_kimi_path_config 写入 shell 配置"
+  else
+    log "FAIL ensure_kimi_path_config 写入 shell 配置"
     failed=1
   fi
 
@@ -817,6 +1234,22 @@ selftest() {
     log "FAIL raw_metrics 无法检查计为异常 (got: $out)"
     failed=1
   fi
+
+  if status_needs_update "迁移未完成"; then
+    log "PASS status_needs_update 迁移未完成"
+  else
+    log "FAIL status_needs_update 迁移未完成"
+    failed=1
+  fi
+
+  if status_needs_fix "PATH未配置"; then
+    log "PASS status_needs_fix PATH未配置"
+  else
+    log "FAIL status_needs_fix PATH未配置"
+    failed=1
+  fi
+
+  rm -rf "$tmp_home"
 
   if [ "$failed" -eq 0 ]; then
     log "SELFTEST OK"
@@ -1002,7 +1435,7 @@ check_one_kimi() {
   version="${probe##*|}"
   latest="$(latest_kimi_version)"
 
-  result="$(status_and_tip_kimi "$state" "$version" "$latest")"
+  result="$(status_and_tip_kimi "$state" "$version" "$latest" "$path")"
   status="${result%%|*}"
   tip="${result#*|}"
 
@@ -1078,7 +1511,7 @@ raw_status_kimi() {
   version="${probe##*|}"
   latest="$(latest_kimi_version)"
 
-  result="$(status_and_tip_kimi "$state" "$version" "$latest")"
+  result="$(status_and_tip_kimi "$state" "$version" "$latest" "$path")"
   status="${result%%|*}"
   tip="${result#*|}"
 
@@ -1141,7 +1574,7 @@ snapshot_one_kimi() {
   version="${probe##*|}"
   latest="$(latest_kimi_version)"
 
-  result="$(status_and_tip_kimi "$state" "$version" "$latest")"
+  result="$(status_and_tip_kimi "$state" "$version" "$latest" "$path")"
   status="${result%%|*}"
   tip="${result#*|}"
 
@@ -1228,13 +1661,26 @@ repair_or_update_one() {
 
 repair_or_update_kimi() {
   local mode="${1:-fix}"
-  local current_state
+  local current_state probe
 
-  current_state="$(probe_kimi)"
-  current_state="${current_state%%|*}"
+  probe="$(probe_kimi)"
+  current_state="${probe%%|*}"
+
+  if [ "$mode" = "fix" ]; then
+    if [ "$current_state" != "ok" ]; then
+      install_kimi
+    fi
+    ensure_kimi_path_config
+    return 0
+  fi
 
   if [ "$mode" = "update" ] || [ "$current_state" != "ok" ]; then
-    install_kimi "$mode"
+    install_kimi
+    ensure_kimi_path_config
+    if ! run_kimi_migration_if_needed; then
+      return 1
+    fi
+    return 0
   fi
 }
 
@@ -1353,7 +1799,7 @@ raw_metrics() {
     NF >= 5 {
       total++
       status = $5
-      if (status == "可更新") {
+      if (status == "可更新" || status == "迁移未完成") {
         updatable++
       } else if (status == "已是最新" || status == "本地更新" || status == "已安装" || status == "无需处理") {
         healthy++
@@ -1375,7 +1821,7 @@ raw_tool_record() {
 
 status_needs_update() {
   case "${1:-}" in
-    可更新)
+    可更新|迁移未完成)
       return 0
       ;;
     *)
@@ -1386,7 +1832,7 @@ status_needs_update() {
 
 status_needs_fix() {
   case "${1:-}" in
-    未安装|不可执行|异常比较结果)
+    未安装|不可执行|PATH未配置|异常比较结果)
       return 0
       ;;
     *)
@@ -1514,7 +1960,16 @@ run_all_compact() {
     updated_count=0
     for key in $update_keys; do
       name="$(tool_display_name "$key")"
-      run_detailed_with_fallback "[3/4] 更新 ${name}" update-one "$key"
+      if [ "$key" = "kimi" ]; then
+        if ! repair_or_update_kimi "update"; then
+          log "$(color "$ANSI_RED$ANSI_BOLD" "[3/4] 更新 ${name} 失败" "$ANSI_RESET")"
+          log "请执行 ./scripts/ai-toolchain-manager.sh update-one kimi 查看详细输出。"
+          return 1
+        fi
+        ensure_links
+      else
+        run_detailed_with_fallback "[3/4] 更新 ${name}" update-one "$key"
+      fi
       updated_count=$((updated_count + 1))
     done
     raw_final="$(check_raw)"
@@ -1559,9 +2014,18 @@ run_update_one_compact() {
 
   IFS='|' read -r _ _ current latest status _ _ <<<"$record"
   case "$status" in
-    可更新|未安装|不可执行|异常比较结果)
+    可更新|迁移未完成|未安装|不可执行|异常比较结果)
       log "更新 ${tool_name} 中..."
-      run_detailed_with_fallback "更新 ${tool_name}" update-one "$tool_key"
+      if [ "$tool_key" = "kimi" ]; then
+        if ! repair_or_update_kimi "update"; then
+          log "$(color "$ANSI_RED$ANSI_BOLD" "更新 ${tool_name} 失败" "$ANSI_RESET")"
+          log "请执行 ./scripts/ai-toolchain-manager.sh update-one kimi 查看详细输出。"
+          return 1
+        fi
+        ensure_links
+      else
+        run_detailed_with_fallback "更新 ${tool_name}" update-one "$tool_key"
+      fi
       log "更新 ${tool_name} 完成。"
       ;;
     无法检查)
@@ -1608,7 +2072,7 @@ main() {
   done
 
   case "$mode" in
-    snapshot|check|fix|update|all|selftest|check-raw|update-one|uninstall-gemini) ;;
+    snapshot|check|fix|update|all|selftest|check-raw|update-one|uninstall-gemini|fix-kimi-vscode) ;;
     -h|--help|help)
       usage
       exit 0
@@ -1660,6 +2124,11 @@ main() {
   if [ "$mode" = "uninstall-gemini" ]; then
     uninstall_gemini_cli
     return 0
+  fi
+
+  if [ "$mode" = "fix-kimi-vscode" ]; then
+    fix_kimi_vscode
+    return $?
   fi
 
   if [ "$mode" = "all" ]; then
