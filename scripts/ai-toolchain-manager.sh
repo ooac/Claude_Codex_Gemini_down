@@ -160,7 +160,7 @@ usage() {
   update  升级到最新版本，并修复入口
   update-one 仅更新单个工具
   uninstall-gemini 彻底卸载 Gemini CLI（含用户数据目录）
-  fix-kimi-vscode 将 VS Code Kimi 插件指向新版 Kimi Code CLI
+  fix-kimi-vscode 清空 VS Code Kimi 插件自定义路径，改用插件内置 CLI
   all     一键执行：check -> fix -> update -> check
   selftest  仅执行逻辑回归测试，不安装不更新
   --compact 仅输出简略进度（建议用于 all / update-one）
@@ -1063,34 +1063,119 @@ uninstall_gemini_cli() {
   fi
 }
 
-fix_kimi_vscode() {
-  local kimi_cmd settings_path output exit_code
-  kimi_cmd="${KIMI_CODE_HOME:-$HOME/.kimi-code}/bin/kimi"
-  if [ ! -x "$kimi_cmd" ]; then
-    kimi_cmd="$(resolve_kimi_cmd)"
+kimi_vscode_extension_dir() {
+  local dir
+  dir="$(ls -dt "$HOME/.vscode/extensions"/moonshot-ai.kimi-code-* 2>/dev/null | head -n 1 || true)"
+  printf '%s' "$dir"
+}
+
+kimi_vscode_builtin_cli_path() {
+  printf '%s' "$HOME/Library/Application Support/Code/User/globalStorage/moonshot-ai.kimi-code/bin/kimi/kimi"
+}
+
+ensure_kimi_vscode_builtin_cli() {
+  local extension_dir manifest_path archive_path storage_dir builtin_cli manifest_info version platform output
+  extension_dir="$(kimi_vscode_extension_dir)"
+  if [ -z "$extension_dir" ] || [ ! -d "$extension_dir" ]; then
+    printf '未找到 Kimi VS Code 插件目录：~/.vscode/extensions/moonshot-ai.kimi-code-*\n' >&2
+    return 1
   fi
+
+  manifest_path="$extension_dir/bin/kimi/manifest.json"
+  archive_path="$extension_dir/bin/kimi/archive.tar.gz"
+  storage_dir="$HOME/Library/Application Support/Code/User/globalStorage/moonshot-ai.kimi-code/bin/kimi"
+  builtin_cli="$storage_dir/kimi"
+
+  if [ ! -f "$manifest_path" ]; then
+    printf 'Kimi VS Code 插件缺少内置 CLI manifest：%s\n' "$manifest_path" >&2
+    return 1
+  fi
+  if [ ! -f "$archive_path" ]; then
+    printf 'Kimi VS Code 插件缺少内置 CLI 归档：%s\n' "$archive_path" >&2
+    return 1
+  fi
+
+  manifest_info="$(python3 - "$manifest_path" <<'PY'
+import json
+import platform
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+machine = platform.machine().lower()
+if sys.platform == "darwin":
+    os_name = "darwin"
+elif sys.platform.startswith("linux"):
+    os_name = "linux"
+elif sys.platform.startswith("win"):
+    os_name = "win32"
+else:
+    os_name = sys.platform
+
+arch = "arm64" if machine in {"arm64", "aarch64"} else "x64"
+platform_key = f"{os_name}-{arch}"
+print(f"{data.get('version', '')}|{platform_key}")
+PY
+)"
+  version="${manifest_info%%|*}"
+  platform="${manifest_info#*|}"
+
+  if [ -x "$builtin_cli" ] && [ -f "$storage_dir/installed.json" ]; then
+    if python3 - "$storage_dir/installed.json" "$version" "$platform" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+raise SystemExit(0 if data.get("version") == sys.argv[2] and data.get("platform") == sys.argv[3] else 1)
+PY
+    then
+      if "$builtin_cli" info --json >/dev/null 2>&1; then
+        printf '%s' "$builtin_cli"
+        return 0
+      fi
+    fi
+  fi
+
+  rm -rf "$storage_dir"
+  mkdir -p "$storage_dir"
+  tar -xzf "$archive_path" -C "$storage_dir" --strip-components=1
+  chmod 755 "$builtin_cli"
+  python3 - "$storage_dir/installed.json" "$version" "$platform" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.write_text(
+    json.dumps({"version": sys.argv[2], "platform": sys.argv[3], "type": "native"}, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+
+  if ! output="$("$builtin_cli" info --json 2>&1)"; then
+    printf 'Kimi VS Code 插件内置 CLI 校验失败：%s\n%s\n' "$builtin_cli" "$output" >&2
+    return 1
+  fi
+
+  printf '%s' "$builtin_cli"
+}
+
+fix_kimi_vscode() {
+  local settings_path builtin_cli output
 
   log "$(color "$ANSI_BOLD$ANSI_CYAN" "执行模式：fix-kimi-vscode" "$ANSI_RESET")"
   log ""
 
-  if [ -z "$kimi_cmd" ] || [ ! -x "$kimi_cmd" ]; then
-    printf '未找到新版 Kimi Code CLI。请先执行 update-one kimi 或重新安装 Kimi Code。\n' >&2
-    return 1
-  fi
-
-  if ! "$kimi_cmd" --version >/dev/null 2>&1; then
-    printf '新版 Kimi Code CLI 不可执行：%s\n' "$kimi_cmd" >&2
-    return 1
-  fi
-
   settings_path="$HOME/Library/Application Support/Code/User/settings.json"
-  python3 - "$settings_path" "$kimi_cmd" <<'PY'
+  python3 - "$settings_path" <<'PY'
 import json
 import pathlib
 import sys
 
 settings_path = pathlib.Path(sys.argv[1])
-kimi_cmd = sys.argv[2]
 settings_path.parent.mkdir(parents=True, exist_ok=True)
 
 if settings_path.exists() and settings_path.read_text(encoding="utf-8").strip():
@@ -1104,34 +1189,22 @@ else:
 if not isinstance(data, dict):
     raise SystemExit("VS Code settings.json 根节点不是对象，无法安全写入。")
 
-data["kimi.executablePath"] = kimi_cmd
+data["kimi.executablePath"] = ""
 settings_path.write_text(
     json.dumps(data, ensure_ascii=False, indent=2) + "\n",
     encoding="utf-8",
 )
 PY
 
-  log "已写入 VS Code 设置：kimi.executablePath = ${kimi_cmd}"
+  log "已清空 VS Code 设置：kimi.executablePath"
+  log "Kimi VS Code 插件将使用内置 CLI。"
 
-  set +e
-  output="$("$kimi_cmd" info --json 2>&1)"
-  exit_code=$?
-  set -e
+  builtin_cli="$(ensure_kimi_vscode_builtin_cli)"
+  log "内置 CLI 路径：${builtin_cli}"
 
-  if [ "$exit_code" -eq 0 ]; then
-    log "$(color "$ANSI_GREEN$ANSI_BOLD" "Kimi VS 插件兼容性校验通过。" "$ANSI_RESET")"
-    return 0
-  fi
-
-  log "$(color "$ANSI_RED$ANSI_BOLD" "Kimi VS 插件兼容性校验失败。" "$ANSI_RESET")"
-  log "已按要求指向新版 Kimi Code CLI，但当前 VS Code 插件仍在调用旧协议：info --json。"
-  if printf '%s\n' "$output" | grep -Fq "unknown option '--json'"; then
-    log "结论：当前 Kimi VS Code 插件版本不兼容新版 Kimi Code CLI，需要等待或升级插件适配。"
-  else
-    log "CLI 输出："
-    printf '%s\n' "$output"
-  fi
-  return 1
+  output="$("$builtin_cli" info --json)"
+  log "$(color "$ANSI_GREEN$ANSI_BOLD" "Kimi VS 插件内置 CLI 校验通过。" "$ANSI_RESET")"
+  printf '%s\n' "$output" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("CLI 版本：%s，协议版本：%s" % (d.get("kimi_cli_version", "-"), d.get("wire_protocol_version", "-")))'
 }
 
 selftest() {

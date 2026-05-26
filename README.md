@@ -31,7 +31,7 @@ Kimi 的命令入口检测会额外确认 `kimi` 是否能直接从终端启动�
 - 若新版入口存在于 `~/.kimi-code/bin/kimi`，但 `command -v kimi` 找不到，会显示 `PATH未配置`
 - 执行 `fix` 会把 `~/.kimi-code/bin` 写入 fish、zsh、bash 常见配置文件，之后新终端可直接输入 `kimi`
 - Kimi 登录态不会迁移；启动后如提示 OAuth 过期，请在 Kimi 界面输入 `/login`
-`fix-kimi-vscode` 会把 VS Code 的 `kimi.executablePath` 指向新版 `~/.kimi-code/bin/kimi`；如果插件仍调用旧协议 `info --json`，脚本会明确报告当前插件版本不兼容新版 Kimi Code CLI。
+`fix-kimi-vscode` 会清空 VS Code 的 `kimi.executablePath`，让 Kimi VS Code 插件使用插件内置 CLI，并校验 `info --json` 可用；新版 `~/.kimi-code/bin/kimi` 继续用于终端。
 Kimi 升级成功的定义是“安装成功 + 数据迁移校验通过”：
 - 仅在 `update` / `update-one kimi` / `all --compact` 涉及 Kimi 更新时触发迁移
 - 迁移后强校验 `migration-report.json` 与 `~/.kimi/.migrated-to-kimi-code` 中最近一次会话迁移记录，按官方实际可迁移会话数校验

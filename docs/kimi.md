@@ -2,7 +2,7 @@
 
 > 更新时间：2026-05-26
 
-本文记录本仓库对 Kimi 的管理边界、升级逻辑、数据迁移逻辑，以及当前 Kimi VS Code 插件无法直接连接新版 Kimi Code CLI 的原因。
+本文记录本仓库对 Kimi 的管理边界、升级逻辑、数据迁移逻辑，以及 Kimi VS Code 插件与新版 Kimi Code CLI 的兼容边界。
 
 ## 1. Kimi CLI 当前情况
 
@@ -103,9 +103,11 @@ kimi migrate
 
 注意：官方迁移会跳过空会话或无效会话，因此脚本不会再按旧目录全部 `state.json` 数量做死板比较。
 
-## 4. Kimi VS Code 插件当前情况
+## 4. Kimi VS Code 插件当前情况与处理策略
 
-当前 VS Code 插件设置里存在：
+Kimi VS Code 插件支持 `kimi.executablePath` 设置。这个值如果不为空，插件会把它当成自定义 CLI。
+
+之前 VS Code 设置里存在：
 
 ```json
 "kimi.executablePath": "kimi"
@@ -133,6 +135,12 @@ kimi export
 
 它不是当前 VS Code 插件所期待的旧 `kimi-cli` 协议入口。
 
+因此当前处理策略是：
+
+- 终端使用新版 `~/.kimi-code/bin/kimi`。
+- VS Code 插件先使用插件内置 CLI，保证插件面板能正常连接。
+- 等官方插件适配新版 Kimi Code CLI 后，再考虑切回新版 CLI。
+
 ## 5. 为什么 VS Code 插件无法直接接新版 CLI
 
 这不是 PATH 问题，也不是 `kimi.executablePath` 没写对。
@@ -143,6 +151,8 @@ kimi export
 - 新版 Kimi Code CLI 没有 `info` 子命令，也不支持 `--json` 全局参数。
 - 插件后续还依赖旧 wire protocol。
 - 因此即使把 `kimi.executablePath` 写成 `~/.kimi-code/bin/kimi` 的绝对路径，也无法让当前插件版本直接使用新版 CLI。
+- 插件内置 CLI 是当前插件协议的匹配版本，支持 `info --json`。
+- 为了让 VS Code 插件可用，必须让 `kimi.executablePath` 为空，让插件回到内置 CLI。
 
 ## 6. 本仓库提供的 VS 插件修复能力
 
@@ -160,27 +170,21 @@ kimi export
 
 该命令会：
 
-- 找到新版 Kimi Code CLI：`~/.kimi-code/bin/kimi`
-- 确认它可以执行 `--version`
-- 把 VS Code 用户设置写成绝对路径：
+- 清空 VS Code 用户设置里的自定义 CLI 路径：
 
 ```json
-"kimi.executablePath": "/Users/当前用户/.kimi-code/bin/kimi"
+"kimi.executablePath": ""
 ```
 
-- 再执行兼容性校验：
+- 让插件使用自己的内置 CLI。
+- 如果 VS Code globalStorage 里的内置 CLI 缓存缺失或版本不匹配，脚本会从插件目录中的 `bin/kimi/archive.tar.gz` 重新解压。
+- 再执行内置 CLI 校验：
 
 ```bash
-~/.kimi-code/bin/kimi info --json
+~/Library/Application Support/Code/User/globalStorage/moonshot-ai.kimi-code/bin/kimi/kimi info --json
 ```
 
-如果返回 `unknown option '--json'`，脚本会明确失败并提示：
-
-```text
-当前 Kimi VS Code 插件版本不兼容新版 Kimi Code CLI，需要等待或升级插件适配。
-```
-
-这是有意设计：脚本不会为了显示成功而切回插件内置 CLI，也不会假装新版 CLI 已能接入当前插件。
+校验通过后，VS Code 里需要重新加载窗口或重启 VS Code，让插件重新读取设置。
 
 ## 7. 当前可用方案
 
@@ -199,6 +203,12 @@ kimi
 ./scripts/ai-toolchain-manager.sh fix
 ```
 
+- 通过本仓库脚本修复 VS Code 插件，让它使用插件内置 CLI：
+
+```bash
+./scripts/ai-toolchain-manager.sh fix-kimi-vscode
+```
+
 暂不可用：
 
 - 当前 Kimi VS Code 插件直接使用新版 `~/.kimi-code/bin/kimi` 作为后端。
@@ -207,4 +217,3 @@ kimi
 
 - Kimi 官方发布适配新版 Kimi Code CLI 的 VS Code 插件。
 - 或官方新版 CLI 恢复/提供兼容插件的 `info --json` 与 wire protocol。
-
