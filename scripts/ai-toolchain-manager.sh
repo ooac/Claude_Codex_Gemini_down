@@ -145,11 +145,12 @@ card_row() {
 usage() {
   cat <<'EOF'
 用法：
-  scripts/ai-toolchain-manager.sh [snapshot|check|fix|update|all|selftest|check-raw|update-one|uninstall-gemini|fix-kimi-vscode]
+  scripts/ai-toolchain-manager.sh [snapshot|check|fix|update|all|selftest|check-raw|update-one|uninstall-gemini|uninstall-kimi-cli|fix-kimi-vscode]
   scripts/ai-toolchain-manager.sh update-one [claude|codex|antigravity|kimi]
   scripts/ai-toolchain-manager.sh all --compact
   scripts/ai-toolchain-manager.sh update-one codex --compact
   scripts/ai-toolchain-manager.sh uninstall-gemini
+  scripts/ai-toolchain-manager.sh uninstall-kimi-cli
   scripts/ai-toolchain-manager.sh fix-kimi-vscode
 
 说明：
@@ -160,6 +161,7 @@ usage() {
   update  升级到最新版本，并修复入口
   update-one 仅更新单个工具
   uninstall-gemini 彻底卸载 Gemini CLI（含用户数据目录）
+  uninstall-kimi-cli 卸载旧版 Kimi CLI 与旧数据目录，保留新版 Kimi Code 和 VS 插件内置 CLI
   fix-kimi-vscode 清空 VS Code Kimi 插件自定义路径，改用插件内置 CLI
   all     一键执行：check -> fix -> update -> check
   selftest  仅执行逻辑回归测试，不安装不更新
@@ -849,6 +851,246 @@ install_antigravity() {
   curl -fsSL https://antigravity.google/cli/install.sh | bash >/dev/null 2>&1
 }
 
+is_protected_kimi_path() {
+  local candidate="$1"
+  python3 - "$candidate" <<'PY'
+import os
+import pathlib
+import sys
+
+candidate = pathlib.Path(os.path.expanduser(sys.argv[1])).resolve(strict=False)
+home = pathlib.Path.home()
+
+protected_roots = [
+    home / ".kimi-code",
+    home / ".vscode" / "extensions",
+    home / "Library" / "Application Support" / "Code" / "User" / "globalStorage" / "moonshot-ai.kimi-code",
+]
+
+candidate_text = str(candidate)
+for root in protected_roots:
+    root = root.resolve(strict=False)
+    root_text = str(root)
+    if candidate_text == root_text or candidate_text.startswith(root_text + os.sep):
+        if root.name == "extensions":
+            if "/moonshot-ai.kimi-code-" not in candidate_text:
+                continue
+        raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+uninstall_kimi_cli_legacy() {
+  local removed=0
+  local skipped=0
+  local protected_skipped=0
+  local needs_sudo=0
+  local legacy_home="$HOME/.kimi"
+  local migration_health migration_state old_sessions new_sessions old_history new_history reason
+  local npm_prefix prefix package_name package_dir bin_file check_path entry output
+  local -a failures=()
+  local -a prefixes=()
+  local -a package_names=()
+  local -a sudo_targets=()
+  local -a remaining_bins=()
+
+  log "$(color "$ANSI_BOLD$ANSI_CYAN" "执行模式：uninstall-kimi-cli" "$ANSI_RESET")"
+  log ""
+  log "开始卸载旧版 Kimi CLI ..."
+
+  if [ -d "$legacy_home" ]; then
+    old_sessions="$(count_kimi_session_states "$legacy_home")"
+    old_history="$(count_kimi_history_files "$legacy_home")"
+    if [ "$old_sessions" -gt 0 ] || [ "$old_history" -gt 0 ]; then
+      migration_health="$(kimi_migration_health)"
+      IFS='|' read -r migration_state old_sessions new_sessions old_history new_history reason <<<"$migration_health"
+      if [ "$migration_state" != "complete" ]; then
+        log "$(color "$ANSI_RED$ANSI_BOLD" "旧 Kimi 数据迁移未完成，已停止卸载。" "$ANSI_RESET")"
+        log "原因：${reason}，旧会话 ${old_sessions} -> 新会话 ${new_sessions}，旧历史 ${old_history} -> 新历史 ${new_history}。"
+        log "请先执行：./scripts/ai-toolchain-manager.sh update-one kimi"
+        return 1
+      fi
+    fi
+  fi
+
+  prefixes+=("$NPM_GLOBAL_PREFIX")
+  npm_prefix="$(npm config get prefix 2>/dev/null || true)"
+  if [ -n "$npm_prefix" ] && [ "$npm_prefix" != "undefined" ] && [ "$npm_prefix" != "null" ]; then
+    prefixes+=("$npm_prefix")
+  fi
+
+  package_names+=("kimi-cli")
+  package_names+=("@moonshot-ai/kimi-cli")
+  package_names+=("@moonshot/kimi-cli")
+  package_names+=("@moonshotai/kimi-cli")
+
+  for prefix in "${prefixes[@]-}"; do
+    [ -n "$prefix" ] || continue
+    for package_name in "${package_names[@]-}"; do
+      package_dir="$prefix/lib/node_modules/$package_name"
+      if [ -e "$package_dir" ]; then
+        if npm uninstall -g "$package_name" --prefix "$prefix" >/dev/null 2>&1; then
+          removed=$((removed + 1))
+        else
+          needs_sudo=1
+          :
+        fi
+      else
+        skipped=$((skipped + 1))
+      fi
+    done
+
+    for bin_file in "$prefix/bin/kimi-cli" "$prefix/bin/kimi"; do
+      if [ ! -L "$bin_file" ] && [ ! -e "$bin_file" ]; then
+        skipped=$((skipped + 1))
+        continue
+      fi
+
+      if is_protected_kimi_path "$bin_file"; then
+        protected_skipped=$((protected_skipped + 1))
+        continue
+      fi
+
+      if [ "$(basename "$bin_file")" = "kimi" ] && [ -x "$bin_file" ] && has_kimi_migrate_command "$bin_file"; then
+        protected_skipped=$((protected_skipped + 1))
+        continue
+      fi
+
+      if rm -rf "$bin_file" >/dev/null 2>&1; then
+        removed=$((removed + 1))
+      else
+        needs_sudo=1
+        sudo_targets+=("$bin_file")
+      fi
+    done
+  done
+
+  for check_path in \
+    "$HOME/.local/bin/kimi-cli" \
+    "$HOME/.local/bin/kimi" \
+    "/opt/homebrew/bin/kimi-cli" \
+    "/opt/homebrew/bin/kimi" \
+    "/usr/local/bin/kimi-cli" \
+    "/usr/local/bin/kimi" \
+    "$legacy_home"; do
+    if [ ! -L "$check_path" ] && [ ! -e "$check_path" ]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    if is_protected_kimi_path "$check_path"; then
+      protected_skipped=$((protected_skipped + 1))
+      continue
+    fi
+
+    if [ "$(basename "$check_path")" = "kimi" ] && [ -x "$check_path" ] && has_kimi_migrate_command "$check_path"; then
+      protected_skipped=$((protected_skipped + 1))
+      continue
+    fi
+
+    if rm -rf "$check_path" >/dev/null 2>&1; then
+      removed=$((removed + 1))
+    else
+      needs_sudo=1
+      sudo_targets+=("$check_path")
+    fi
+  done
+
+  if [ "$needs_sudo" -eq 1 ]; then
+    log ""
+    log "$(color "$ANSI_YELLOW$ANSI_BOLD" "检测到部分旧 Kimi CLI 残留需要管理员权限，正在请求密码继续删除..." "$ANSI_RESET")"
+    if command -v sudo >/dev/null 2>&1 && [ -t 0 ]; then
+      if sudo -v; then
+        for prefix in "${prefixes[@]-}"; do
+          [ -n "$prefix" ] || continue
+          for package_name in "${package_names[@]-}"; do
+            package_dir="$prefix/lib/node_modules/$package_name"
+            if [ -e "$package_dir" ]; then
+              if sudo npm uninstall -g "$package_name" --prefix "$prefix" >/dev/null 2>&1; then
+                removed=$((removed + 1))
+              elif [ -e "$package_dir" ]; then
+                failures+=("sudo npm 卸载失败：${package_name}（prefix=${prefix}）")
+              fi
+            fi
+          done
+        done
+
+        for check_path in "${sudo_targets[@]-}"; do
+          if [ ! -L "$check_path" ] && [ ! -e "$check_path" ]; then
+            skipped=$((skipped + 1))
+            continue
+          fi
+          if is_protected_kimi_path "$check_path"; then
+            protected_skipped=$((protected_skipped + 1))
+            continue
+          fi
+          if sudo rm -rf "$check_path" >/dev/null 2>&1; then
+            removed=$((removed + 1))
+          elif [ -L "$check_path" ] || [ -e "$check_path" ]; then
+            failures+=("sudo 删除失败：${check_path}")
+          fi
+        done
+      else
+        failures+=("sudo 认证失败，未能继续删除管理员权限残留")
+      fi
+    else
+      failures+=("当前会话无法请求 sudo（缺少 sudo 或非交互终端）")
+    fi
+  fi
+
+  if command -v which >/dev/null 2>&1; then
+    while IFS= read -r entry; do
+      [ -n "$entry" ] || continue
+      remaining_bins+=("$entry")
+    done < <(which -a kimi-cli 2>/dev/null | awk '!seen[$0]++')
+
+    while IFS= read -r entry; do
+      [ -n "$entry" ] || continue
+      if is_protected_kimi_path "$entry"; then
+        continue
+      fi
+      if [ -x "$entry" ] && has_kimi_migrate_command "$entry"; then
+        continue
+      fi
+      remaining_bins+=("$entry")
+    done < <(which -a kimi 2>/dev/null | awk '!seen[$0]++')
+  fi
+
+  log ""
+  log "卸载摘要："
+  log "  已处理：${removed} 项"
+  log "  已跳过：${skipped} 项（不存在或已清理）"
+  log "  保护跳过：${protected_skipped} 项（新版 Kimi Code 或 VS 插件内置 CLI）"
+  if [ "${#failures[@]}" -gt 0 ]; then
+    log "$(color "$ANSI_YELLOW$ANSI_BOLD" "  失败：${#failures[@]} 项" "$ANSI_RESET")"
+    for entry in "${failures[@]-}"; do
+      log "    - ${entry}"
+    done
+  else
+    log "  失败：0 项"
+  fi
+
+  if [ "${#remaining_bins[@]}" -eq 0 ]; then
+    log "$(color "$ANSI_GREEN$ANSI_BOLD" "旧 Kimi CLI 复检：未发现 kimi-cli 或旧架构 kimi 命令残留。" "$ANSI_RESET")"
+  else
+    log "$(color "$ANSI_YELLOW$ANSI_BOLD" "旧 Kimi CLI 复检：仍发现以下路径，请手动处理：" "$ANSI_RESET")"
+    for entry in "${remaining_bins[@]-}"; do
+      log "  - ${entry}"
+    done
+  fi
+
+  output="${KIMI_CODE_HOME:-$HOME/.kimi-code}/bin/kimi"
+  if [ -x "$output" ]; then
+    log "新版 Kimi Code CLI 保留：${output}"
+  fi
+
+  output="$(kimi_vscode_builtin_cli_path)"
+  if [ -x "$output" ]; then
+    log "VS Code 插件内置 CLI 保留：${output}"
+  fi
+}
+
 uninstall_gemini_cli() {
   local removed=0
   local skipped=0
@@ -1320,6 +1562,27 @@ EOF
   else
     log "FAIL status_needs_fix PATH未配置"
     failed=1
+  fi
+
+  if HOME="$tmp_home" is_protected_kimi_path "$tmp_home/.kimi-code/bin/kimi"; then
+    log "PASS is_protected_kimi_path 保护新版 Kimi Code"
+  else
+    log "FAIL is_protected_kimi_path 保护新版 Kimi Code"
+    failed=1
+  fi
+
+  if HOME="$tmp_home" is_protected_kimi_path "$tmp_home/Library/Application Support/Code/User/globalStorage/moonshot-ai.kimi-code/bin/kimi/kimi"; then
+    log "PASS is_protected_kimi_path 保护 VS 插件内置 CLI"
+  else
+    log "FAIL is_protected_kimi_path 保护 VS 插件内置 CLI"
+    failed=1
+  fi
+
+  if HOME="$tmp_home" is_protected_kimi_path "$tmp_home/.kimi"; then
+    log "FAIL is_protected_kimi_path 旧 Kimi 数据不应受保护"
+    failed=1
+  else
+    log "PASS is_protected_kimi_path 旧 Kimi 数据可卸载"
   fi
 
   rm -rf "$tmp_home"
@@ -2145,7 +2408,7 @@ main() {
   done
 
   case "$mode" in
-    snapshot|check|fix|update|all|selftest|check-raw|update-one|uninstall-gemini|fix-kimi-vscode) ;;
+    snapshot|check|fix|update|all|selftest|check-raw|update-one|uninstall-gemini|uninstall-kimi-cli|fix-kimi-vscode) ;;
     -h|--help|help)
       usage
       exit 0
@@ -2197,6 +2460,11 @@ main() {
   if [ "$mode" = "uninstall-gemini" ]; then
     uninstall_gemini_cli
     return 0
+  fi
+
+  if [ "$mode" = "uninstall-kimi-cli" ]; then
+    uninstall_kimi_cli_legacy
+    return $?
   fi
 
   if [ "$mode" = "fix-kimi-vscode" ]; then

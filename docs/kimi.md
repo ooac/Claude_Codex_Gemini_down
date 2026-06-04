@@ -103,7 +103,43 @@ kimi migrate
 
 注意：官方迁移会跳过空会话或无效会话，因此脚本不会再按旧目录全部 `state.json` 数量做死板比较。
 
-## 4. Kimi VS Code 插件当前情况与处理策略
+## 4. 旧 Kimi CLI 卸载边界
+
+脚本提供：
+
+```bash
+./scripts/ai-toolchain-manager.sh uninstall-kimi-cli
+```
+
+菜单入口：
+
+```text
+[m] 卸载 Kimi CLI
+```
+
+该命令只清理旧版 Kimi CLI：
+
+- 旧版 `kimi-cli` 命令。
+- 不支持 `migrate` 的旧架构 `kimi` 命令残留。
+- 常见 npm 全局 prefix 下的旧 Kimi CLI 包目录。
+- 旧数据目录 `~/.kimi`。
+
+删除 `~/.kimi` 前会先检查迁移状态。如果旧目录仍有会话或历史文件，但 `~/.kimi-code` 的迁移校验未完成，命令会停止并提示先执行：
+
+```bash
+./scripts/ai-toolchain-manager.sh update-one kimi
+```
+
+该命令明确不会删除：
+
+- 新版 Kimi Code CLI：`~/.kimi-code/bin/kimi`。
+- 新版 Kimi Code 数据目录：`~/.kimi-code`。
+- VS Code 插件目录：`~/.vscode/extensions/moonshot-ai.kimi-code-*`。
+- VS Code 插件内置 CLI：`~/Library/Application Support/Code/User/globalStorage/moonshot-ai.kimi-code/bin/kimi/kimi`。
+
+如果候选删除路径落在这些保护范围内，脚本会跳过并计入“保护跳过”。
+
+## 5. Kimi VS Code 插件当前情况与处理策略
 
 Kimi VS Code 插件支持 `kimi.executablePath` 设置。这个值如果不为空，插件会把它当成自定义 CLI。
 
@@ -141,7 +177,7 @@ kimi export
 - VS Code 插件先使用插件内置 CLI，保证插件面板能正常连接。
 - 等官方插件适配新版 Kimi Code CLI 后，再考虑切回新版 CLI。
 
-## 5. 为什么 VS Code 插件无法直接接新版 CLI
+## 6. 为什么 VS Code 插件无法直接接新版 CLI
 
 这不是 PATH 问题，也不是 `kimi.executablePath` 没写对。
 
@@ -154,7 +190,7 @@ kimi export
 - 插件内置 CLI 是当前插件协议的匹配版本，支持 `info --json`。
 - 为了让 VS Code 插件可用，必须让 `kimi.executablePath` 为空，让插件回到内置 CLI。
 
-## 6. 本仓库提供的 VS 插件修复能力
+## 7. 本仓库提供的 VS 插件修复能力
 
 脚本提供：
 
@@ -186,7 +222,7 @@ kimi export
 
 校验通过后，VS Code 里需要重新加载窗口或重启 VS Code，让插件重新读取设置。
 
-## 7. 当前可用方案
+## 8. 当前可用方案
 
 可用：
 
@@ -201,6 +237,7 @@ kimi
 ```bash
 ./scripts/ai-toolchain-manager.sh update-one kimi
 ./scripts/ai-toolchain-manager.sh fix
+./scripts/ai-toolchain-manager.sh uninstall-kimi-cli
 ```
 
 - 通过本仓库脚本修复 VS Code 插件，让它使用插件内置 CLI：

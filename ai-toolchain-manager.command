@@ -12,6 +12,7 @@ normalize_mode() {
     "检查"|"check"|"c") printf 'check' ;;
     "修复"|"fix"|"f") printf 'fix' ;;
     "卸载Gemini"|"uninstall-gemini"|"g") printf 'uninstall-gemini' ;;
+    "卸载KimiCLI"|"uninstall-kimi-cli"|"m") printf 'uninstall-kimi-cli' ;;
     "修复KimiVS插件"|"fix-kimi-vscode"|"k") printf 'fix-kimi-vscode' ;;
     "更新"|"update"|"u") printf 'update' ;;
     "快照"|"snapshot"|"s") printf 'snapshot' ;;
@@ -116,7 +117,7 @@ run_interactive_menu() {
     printf '  [2] 仅升级 Codex\n'
     printf '  [3] 仅升级 Antigravity\n'
     printf '  [4] 仅升级 Kimi\n'
-    printf '  [c] 仅检查   [f] 修复异常   [g] 卸载 Gemini   [k] 修复 Kimi VS插件   [q] 退出\n'
+    printf '  [c] 仅检查   [f] 修复异常   [g] 卸载 Gemini   [m] 卸载 Kimi CLI   [k] 修复 Kimi VS插件   [q] 退出\n'
     printf '请输入：'
     if ! read -r input; then
       input="q"
@@ -168,6 +169,10 @@ run_interactive_menu() {
         run_mode uninstall-gemini || true
         printf '\n'
         ;;
+      "m"|"M")
+        run_mode uninstall-kimi-cli || true
+        printf '\n'
+        ;;
       "k"|"K")
         run_mode fix-kimi-vscode || true
         printf '\n'
@@ -177,7 +182,7 @@ run_interactive_menu() {
         break
         ;;
       *)
-        printf '无效输入，请输入回车/1/2/3/4/c/f/g/k/q。\n\n'
+        printf '无效输入，请输入回车/1/2/3/4/c/f/g/m/k/q。\n\n'
         ;;
     esac
   done

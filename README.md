@@ -16,6 +16,7 @@
 - 输入 `c`：只检查
 - 输入 `f`：修复异常
 - 输入 `g`：彻底卸载 Gemini CLI
+- 输入 `m`：卸载旧版 Kimi CLI
 - 输入 `k`：修复 Kimi VS Code 插件的 CLI 路径
 - 输入 `q`：退出
 
@@ -49,6 +50,13 @@ Antigravity 的版本检测命令：`agy --version`
 - VS Code Gemini 相关扩展目录（`google.geminicodeassist-*`、`google.gemini-cli-vscode-ide-companion-*`）
 - 如遇权限不足，会提示输入 sudo 密码继续删除残留
 
+`m`（或命令 `uninstall-kimi-cli`）会清理旧版 Kimi CLI：
+- 旧版 `kimi-cli` 命令和旧架构 `kimi` 命令残留
+- 常见 npm 全局 prefix 下的旧 Kimi CLI 包目录
+- 旧数据目录 `~/.kimi`，但删除前会校验数据已迁移到 `~/.kimi-code`
+- 不会删除新版 Kimi Code CLI：`~/.kimi-code/bin/kimi`
+- 不会删除 VS Code 插件内置 CLI：`~/Library/Application Support/Code/User/globalStorage/moonshot-ai.kimi-code/bin/kimi/kimi`
+
 ## 复制到其他电脑
 
 前置依赖（目标电脑）：
@@ -76,6 +84,7 @@ chmod +x ai-toolchain-manager.command scripts/ai-toolchain-manager.sh
 ./scripts/ai-toolchain-manager.sh update-one antigravity
 ./scripts/ai-toolchain-manager.sh update-one antigravity --compact
 ./scripts/ai-toolchain-manager.sh uninstall-gemini
+./scripts/ai-toolchain-manager.sh uninstall-kimi-cli
 ./scripts/ai-toolchain-manager.sh fix-kimi-vscode
 ```
 
