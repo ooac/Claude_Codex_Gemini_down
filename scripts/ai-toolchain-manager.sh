@@ -6,6 +6,12 @@ set -euo pipefail
 # - fix：修复损坏的安装和命令入口
 # - update：升级到最新版本并修复入口
 
+LOCAL_NODE_BIN="$HOME/.local/bin"
+case ":${PATH}:" in
+  *":${LOCAL_NODE_BIN}:"*) ;;
+  *) export PATH="${LOCAL_NODE_BIN}:${PATH}" ;;
+esac
+
 NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmjs.org}"
 NPM_CACHE="${NPM_CACHE:-$HOME/.cache/ai-toolchain-npm}"
 NPM_GLOBAL_PREFIX="${NPM_GLOBAL_PREFIX:-$HOME/.npm-global}"
@@ -848,7 +854,57 @@ run_kimi_migration_if_needed() {
 }
 
 install_antigravity() {
-  curl -fsSL https://antigravity.google/cli/install.sh | bash >/dev/null 2>&1
+  curl -fsSL https://antigravity.google/cli/install.sh | bash
+}
+
+antigravity_version_from_path() {
+  local path="$1"
+  local output
+
+  if ! output="$("$path" --version 2>&1)"; then
+    printf ''
+    return 0
+  fi
+  extract_version "$output"
+}
+
+update_antigravity_to_version() {
+  local path="$1"
+  local target_version="$2"
+  local attempt update_output update_exit current_version cmp
+
+  if [ ! -x "$path" ]; then
+    printf '错误：Antigravity 命令不可执行：%s\n' "$path" >&2
+    return 1
+  fi
+
+  for attempt in 1 2; do
+    update_exit=0
+    update_output="$("$path" update 2>&1)" || update_exit=$?
+    if [ -n "$update_output" ]; then
+      printf '%s\n' "$update_output"
+    fi
+
+    current_version="$(antigravity_version_from_path "$path")"
+    if [ -n "$current_version" ]; then
+      cmp="$(semver_cmp "$current_version" "$target_version")"
+      if [ "$cmp" != "-1" ]; then
+        return 0
+      fi
+    fi
+
+    if [ "$attempt" -eq 1 ]; then
+      if [ "$update_exit" -ne 0 ]; then
+        printf 'Antigravity 更新失败（exit=%s），正在重试。\n' "$update_exit" >&2
+      else
+        printf 'Antigravity 更新命令已完成，但版本仍为 %s，正在重试。\n' "${current_version:--}" >&2
+      fi
+    fi
+  done
+
+  printf '错误：Antigravity 更新未达到目标版本：当前版本 %s，目标版本 %s。\n' \
+    "${current_version:--}" "$target_version" >&2
+  return 1
 }
 
 is_protected_kimi_path() {
@@ -1451,7 +1507,7 @@ PY
 
 selftest() {
   local failed=0
-  local out
+  local out raw_fixture
   local tmp_home
 
   tmp_home="$(mktemp -d)"
@@ -1547,6 +1603,68 @@ EOF
     log "PASS raw_metrics 无法检查计为异常"
   else
     log "FAIL raw_metrics 无法检查计为异常 (got: $out)"
+    failed=1
+  fi
+
+  raw_fixture="$(printf '%s\n' \
+    'claude|Claude|2.1.246|2.1.246|已是最新|无需处理|/tmp/claude' \
+    'codex|Codex|0.149.1|0.149.1|已是最新|无需处理|/tmp/codex' \
+    'antigravity|Antigravity|1.1.20|1.1.21|可更新|建议执行 update|/tmp/agy' \
+    'kimi|Kimi|0.38.0|0.38.0|已是最新|无需处理|/tmp/kimi')"
+  if out="$(compact_action_counts "$raw_fixture" 2>&1)" && [ "$out" = "1|0" ]; then
+    log "PASS compact_action_counts 仅统计实际待更新项"
+  else
+    log "FAIL compact_action_counts 待更新数量错误 (got: $out)"
+    failed=1
+  fi
+
+  mkdir -p "$tmp_home/fake-antigravity"
+  printf '1.1.20\n' >"$tmp_home/fake-antigravity/version"
+  printf '0\n' >"$tmp_home/fake-antigravity/attempts"
+  cat >"$tmp_home/fake-antigravity/agy" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+fixture_dir="$(cd "$(dirname "$0")" && pwd)"
+case "${1:-}" in
+  --version)
+    cat "$fixture_dir/version"
+    ;;
+  update)
+    attempts="$(cat "$fixture_dir/attempts")"
+    attempts=$((attempts + 1))
+    printf '%s\n' "$attempts" >"$fixture_dir/attempts"
+    if [ "$attempts" -ge 2 ] && [ ! -e "$fixture_dir/stay-stale" ]; then
+      printf '1.1.21\n' >"$fixture_dir/version"
+    fi
+    printf 'Update command completed.\n'
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+EOF
+  chmod 755 "$tmp_home/fake-antigravity/agy"
+
+  if out="$(update_antigravity_to_version "$tmp_home/fake-antigravity/agy" "1.1.21" 2>&1)" \
+    && [ "$(cat "$tmp_home/fake-antigravity/version")" = "1.1.21" ] \
+    && [ "$(cat "$tmp_home/fake-antigravity/attempts")" = "2" ]; then
+    log "PASS update_antigravity_to_version 版本未变化时重试"
+  else
+    log "FAIL update_antigravity_to_version 版本未变化时重试 (got: $out)"
+    failed=1
+  fi
+
+  printf '1.1.20\n' >"$tmp_home/fake-antigravity/version"
+  printf '0\n' >"$tmp_home/fake-antigravity/attempts"
+  touch "$tmp_home/fake-antigravity/stay-stale"
+  if out="$(update_antigravity_to_version "$tmp_home/fake-antigravity/agy" "1.1.21" 2>&1)"; then
+    log "FAIL update_antigravity_to_version 版本持续未变化时应失败"
+    failed=1
+  elif printf '%s\n' "$out" | grep -Fq '当前版本 1.1.20，目标版本 1.1.21'; then
+    log "PASS update_antigravity_to_version 失败信息包含当前与目标版本"
+  else
+    log "FAIL update_antigravity_to_version 失败信息不具体 (got: $out)"
     failed=1
   fi
 
@@ -2022,7 +2140,7 @@ repair_or_update_kimi() {
 
 repair_or_update_antigravity() {
   local mode="${1:-fix}"
-  local probe state path version latest result status
+  local probe state path version latest result status post_probe post_state post_version post_cmp
 
   probe="$(probe_antigravity)"
   state="${probe%%|*}"
@@ -2047,7 +2165,8 @@ repair_or_update_antigravity() {
       case "$status" in
         可更新)
           if [ -n "$path" ] && [ -x "$path" ]; then
-            if ! "$path" update >/dev/null 2>&1; then
+            if ! update_antigravity_to_version "$path" "$latest"; then
+              log "Antigravity 内置更新未达到目标版本，改用官方安装脚本。"
               install_antigravity
             fi
           else
@@ -2059,12 +2178,25 @@ repair_or_update_antigravity() {
           ;;
         已安装)
           if [ -n "$path" ] && [ -x "$path" ]; then
-            "$path" update >/dev/null 2>&1 || true
+            "$path" update
           fi
           ;;
         *)
           ;;
       esac
+
+      post_probe="$(probe_antigravity)"
+      post_state="${post_probe%%|*}"
+      post_version="${post_probe##*|}"
+      if [ "$post_state" != "ok" ]; then
+        die "Antigravity 更新后不可执行：${path:--}"
+      fi
+      if [ -n "$latest" ] && [ "$latest" != "-" ]; then
+        post_cmp="$(semver_cmp "$post_version" "$latest")"
+        if [ "$post_cmp" = "-1" ]; then
+          die "Antigravity 更新未达到目标版本：当前版本 ${post_version:--}，目标版本 ${latest}。"
+        fi
+      fi
       ;;
     *)
       die "未知模式：$mode"
@@ -2222,6 +2354,17 @@ collect_tool_keys() {
   printf '%s' "$out"
 }
 
+compact_action_counts() {
+  local raw="$1"
+  local update_keys update_count metrics issue_count
+
+  update_keys="$(collect_tool_keys "$raw" update)"
+  update_count="$(count_tool_keys "$update_keys")"
+  metrics="$(raw_metrics "$raw")"
+  IFS='|' read -r _ _ _ issue_count <<<"$metrics"
+  printf '%s|%s' "$update_count" "$issue_count"
+}
+
 run_detailed_with_fallback() {
   local stage_title="$1"
   shift
@@ -2243,7 +2386,7 @@ run_detailed_with_fallback() {
 
 run_all_compact() {
   local raw_before raw_after_fix raw_final
-  local metrics before_updatable before_issue final_updatable final_issue
+  local action_counts before_updatable before_issue final_updatable final_issue
   local fix_keys update_keys fix_count update_count fixed_count updated_count key name
   local remaining_issue remaining_update
 
@@ -2252,8 +2395,8 @@ run_all_compact() {
 
   log "[1/4] 检查中..."
   raw_before="$(check_raw)"
-  metrics="$(raw_metrics "$raw_before")"
-  IFS='|' read -r _ before_updatable _ before_issue <<<"$metrics"
+  action_counts="$(compact_action_counts "$raw_before")"
+  IFS='|' read -r before_updatable before_issue <<<"$action_counts"
   fix_keys="$(collect_tool_keys "$raw_before" fix)"
   update_keys="$(collect_tool_keys "$raw_before" update)"
   fix_count="$(count_tool_keys "$fix_keys")"
@@ -2322,8 +2465,8 @@ run_all_compact() {
   log ""
 
   log "[4/4] 复检中..."
-  metrics="$(raw_metrics "$raw_final")"
-  IFS='|' read -r _ final_updatable _ final_issue <<<"$metrics"
+  action_counts="$(compact_action_counts "$raw_final")"
+  IFS='|' read -r final_updatable final_issue <<<"$action_counts"
   log "[4/4] 复检完成：可更新 ${final_updatable} 项，异常 ${final_issue} 项。"
   if [ "$final_updatable" -eq 0 ] && [ "$final_issue" -eq 0 ]; then
     log "$(color "$ANSI_GREEN$ANSI_BOLD" "结果：全部已是最新，且无异常。" "$ANSI_RESET")"

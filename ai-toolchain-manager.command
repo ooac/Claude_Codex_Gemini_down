@@ -6,6 +6,12 @@ SCRIPT_PATH="$ROOT_DIR/scripts/ai-toolchain-manager.sh"
 RAW_STATUS=""
 cd "$ROOT_DIR"
 
+LOCAL_NODE_BIN="$HOME/.local/bin"
+case ":${PATH}:" in
+  *":${LOCAL_NODE_BIN}:"*) ;;
+  *) export PATH="${LOCAL_NODE_BIN}:${PATH}" ;;
+esac
+
 normalize_mode() {
   case "${1:-}" in
     "一键搞定"|"auto"|"all") printf 'all' ;;
