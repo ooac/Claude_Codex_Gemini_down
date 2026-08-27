@@ -322,6 +322,17 @@ ensure_link() {
   ln -sfn "$target_path" "$link_path"
 }
 
+ensure_antigravity_system_entry() {
+  local system_entry="$1"
+  local local_entry="$2"
+
+  if [ -x "$system_entry" ]; then
+    return 0
+  fi
+
+  ensure_link "$system_entry" "$local_entry"
+}
+
 resolve_system_bin_dir() {
   if [ -n "$SYSTEM_BIN_DIR" ]; then
     printf '%s' "$SYSTEM_BIN_DIR"
@@ -394,8 +405,13 @@ probe_kimi() {
 }
 
 probe_antigravity() {
-  local output version path
-  path="$(command -v agy 2>/dev/null || true)"
+  local output version path system_bin
+  system_bin="$(resolve_system_bin_dir)"
+  if [ -n "$system_bin" ] && [ -x "$system_bin/agy" ]; then
+    path="$system_bin/agy"
+  else
+    path="$(command -v agy 2>/dev/null || true)"
+  fi
   if [ -z "$path" ] && [ -x "$HOME/.local/bin/agy" ]; then
     path="$HOME/.local/bin/agy"
   fi
@@ -1668,6 +1684,68 @@ EOF
     failed=1
   fi
 
+  mkdir -p "$tmp_home/system-bin" "$tmp_home/local-bin"
+  cat >"$tmp_home/system-bin/agy" <<'EOF'
+#!/bin/sh
+printf '1.1.21\n'
+EOF
+  cat >"$tmp_home/local-bin/agy" <<'EOF'
+#!/bin/sh
+printf '1.1.19\n'
+EOF
+  chmod 755 "$tmp_home/system-bin/agy" "$tmp_home/local-bin/agy"
+  if HOME="$tmp_home" \
+    LOCAL_BIN_DIR="$tmp_home/local-bin" \
+    SYSTEM_BIN_DIR="$tmp_home/system-bin" \
+    CLAUDE_PREFIX="$tmp_home/claude-prefix" \
+    NPM_GLOBAL_PREFIX="$tmp_home/npm-prefix" \
+    CLAUDE_APP_LINK="$tmp_home/claude-app/claude" \
+    ensure_links \
+    && [ ! -L "$tmp_home/system-bin/agy" ] \
+    && [ "$("$tmp_home/system-bin/agy")" = "1.1.21" ]; then
+    log "PASS ensure_links 保留现有 Antigravity 新版入口"
+  else
+    log "FAIL ensure_links 覆盖了现有 Antigravity 新版入口"
+    failed=1
+  fi
+
+  rm -f "$tmp_home/system-bin/agy"
+  printf 'damaged\n' >"$tmp_home/system-bin/agy"
+  chmod 644 "$tmp_home/system-bin/agy"
+  if HOME="$tmp_home" \
+    LOCAL_BIN_DIR="$tmp_home/local-bin" \
+    SYSTEM_BIN_DIR="$tmp_home/system-bin" \
+    CLAUDE_PREFIX="$tmp_home/claude-prefix" \
+    NPM_GLOBAL_PREFIX="$tmp_home/npm-prefix" \
+    CLAUDE_APP_LINK="$tmp_home/claude-app/claude" \
+    ensure_links \
+    && [ -L "$tmp_home/system-bin/agy" ] \
+    && [ "$(readlink "$tmp_home/system-bin/agy")" = "$tmp_home/local-bin/agy" ]; then
+    log "PASS ensure_links 修复损坏的 Antigravity 入口"
+  else
+    log "FAIL ensure_links 未修复损坏的 Antigravity 入口"
+    failed=1
+  fi
+
+  rm -f "$tmp_home/system-bin/agy"
+  cat >"$tmp_home/system-bin/agy" <<'EOF'
+#!/bin/sh
+printf '1.1.21\n'
+EOF
+  chmod 755 "$tmp_home/system-bin/agy"
+  out="$(
+    HOME="$tmp_home" \
+    SYSTEM_BIN_DIR="$tmp_home/system-bin" \
+    PATH="$tmp_home/local-bin:/usr/bin:/bin" \
+    probe_antigravity
+  )"
+  if [ "$out" = "ok|$tmp_home/system-bin/agy|1.1.21" ]; then
+    log "PASS probe_antigravity 优先检查系统更新入口"
+  else
+    log "FAIL probe_antigravity 未优先检查系统更新入口 (got: $out)"
+    failed=1
+  fi
+
   if status_needs_update "迁移未完成"; then
     log "PASS status_needs_update 迁移未完成"
   else
@@ -1841,7 +1919,7 @@ ensure_links() {
       ensure_link "$effective_system_bin/claude" "$CLAUDE_APP_LINK"
       ensure_link "$effective_system_bin/codex" "$NPM_GLOBAL_PREFIX/bin/codex"
       if [ -x "$LOCAL_BIN_DIR/agy" ]; then
-        ensure_link "$effective_system_bin/agy" "$LOCAL_BIN_DIR/agy"
+        ensure_antigravity_system_entry "$effective_system_bin/agy" "$LOCAL_BIN_DIR/agy"
       fi
     fi
   fi
